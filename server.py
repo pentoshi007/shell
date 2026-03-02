@@ -12,8 +12,8 @@ import threading
 import sys
 import time
 import queue
+import signal
 import readline  # enables arrow-key history in input()
-readline.parse_and_bind(r'"\C-x": "cancel\n"')  # Ctrl+X = cancel (Ctrl+C would kill server)
 
 pending_command = None
 pending_signal = None
@@ -22,6 +22,20 @@ last_checkin = 0
 result_queue = queue.Queue(maxsize=500)  # (kind, body)  kind = "stream" | "result"
 command_running = False
 
+
+def cancel_shortcut(signum, frame):
+    """Handle Ctrl+\\ to cancel the running remote command."""
+    global pending_signal, pending_command
+    with lock:
+        if command_running or pending_command:
+            pending_signal = "cancel"
+            pending_command = None
+            sys.stdout.write("\r\033[K[*] Cancel signal sent (Ctrl+\\). Client will abort current command.\nshell> ")
+        else:
+            sys.stdout.write("\r\033[K[*] No command is currently running.\nshell> ")
+        sys.stdout.flush()
+
+signal.signal(signal.SIGQUIT, cancel_shortcut)
 
 class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
     """Listen on both IPv4 and IPv6 so cloudflared can connect via either."""
@@ -158,10 +172,11 @@ def input_loop():
 
         if stripped == "help":
             print("[*] Built-in commands:")
-            print("      cancel  — abort the currently running command")
-            print("      status  — check client connectivity")
-            print("      exit    — tell client to shut down")
-            print("      help    — show this message")
+            print("      cancel   — abort the currently running command")
+            print("      Ctrl+\\   — same as cancel (keyboard shortcut)")
+            print("      status   — check client connectivity")
+            print("      exit     — tell client to shut down")
+            print("      help     — show this message")
             print("    Anything else is sent to the remote shell.")
             continue
 

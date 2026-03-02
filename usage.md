@@ -48,8 +48,8 @@ Type these at the `shell>` prompt — they are **not** sent to the remote shell.
 
 **Two ways:**
 
-**1. Keyboard shortcut — `Ctrl+X`** _(recommended)_
-Press `Ctrl+X` at any time while a command is running. This is bound to cancel so that `Ctrl+C` (which kills the server) isn't needed.
+**1. Keyboard shortcut — `Ctrl+\`** _(recommended)_
+Press `Ctrl+\` at any time while a command is running. This sends an instant cancel signal without needing to type anything.
 
 **2. Type `cancel`**
 
@@ -63,7 +63,7 @@ The cancel signal is picked up by the client on its next poll (~200ms), stops th
 [!] Command cancelled by operator.
 ```
 
-> **Note:** `Ctrl+C` exits `server.py` entirely — use `Ctrl+X` or type `cancel` to stop just the remote command.
+> **Note:** `Ctrl+C` exits `server.py` entirely — use `Ctrl+\` or type `cancel` to stop just the remote command.
 
 ---
 
@@ -82,7 +82,7 @@ The header confirms the mode:
 PS C:\> ping -t google.com [no-timeout]
 ```
 
-Always use `Ctrl+X` or `cancel` to stop a no-timeout command when done.
+Always use `Ctrl+\` or `cancel` to stop a no-timeout command when done.
 
 ---
 
@@ -299,7 +299,7 @@ Get-ScheduledTask -TaskName "SystemManagementUpdate" -ErrorAction SilentlyContin
 
 | Action                 | How                                   |
 | ---------------------- | ------------------------------------- |
-| Cancel running command | `Ctrl+X` or type `cancel`             |
+| Cancel running command | `Ctrl+\` or type `cancel`             |
 | Kill the server        | `Ctrl+C`                              |
 | Run with no timeout    | `notimeout:<command>`                 |
 | Check connectivity     | `status`                              |
