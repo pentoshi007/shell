@@ -208,6 +208,93 @@ Output streams adaptively: ~200ms when output is flowing, up to 1s when idle. If
 
 ---
 
+## Finding Running Processes & Full Cleanup
+
+### Mac — server.py
+
+**Find the process:**
+
+```bash
+pgrep -a python3 | grep server.py
+# or
+ps aux | grep server.py
+```
+
+**Kill it:**
+
+```bash
+pkill -f server.py
+# or use the PID from above:
+kill <PID>
+```
+
+**Stop the Cloudflare tunnel:**
+
+```bash
+pkill cloudflared
+```
+
+---
+
+### Windows — pdf2.ps1 (target machine)
+
+**Send a clean shutdown from the server** _(preferred)_:
+
+```
+shell> exit
+```
+
+This tells the client to break its loop and exit gracefully.
+
+**Find the process manually (run on Windows):**
+
+```powershell
+Get-Process powershell | Where-Object { $_.MainWindowTitle -eq "" }
+# or find by PID from shell.txt:
+Get-Process -Id <PID>
+```
+
+**Kill it manually (run on Windows):**
+
+```powershell
+Stop-Process -Id <PID> -Force
+# or kill all hidden PowerShell instances:
+Get-Process powershell | Where-Object { $_.MainWindowTitle -eq "" } | Stop-Process -Force
+```
+
+---
+
+### Full Cleanup on Windows (remove persistence + logs)
+
+Run these on the Windows target to completely remove the client:
+
+```powershell
+# 1. Kill the running process
+$logPath = "C:\path\to\shell.txt"   # adjust to actual path
+$content = Get-Content $logPath | Where-Object { $_ -match "PID=(\d+)" }
+# or just:
+Get-Process powershell | Where-Object { $_.MainWindowTitle -eq "" } | Stop-Process -Force
+
+# 2. Remove the scheduled task
+Unregister-ScheduledTask -TaskName "SystemManagementUpdate" -Confirm:$false
+
+# 3. Delete log files
+Remove-Item "C:\path\to\shell.txt" -Force -ErrorAction SilentlyContinue
+Remove-Item "C:\path\to\shell.txt.old" -Force -ErrorAction SilentlyContinue
+
+# 4. Delete the script itself
+Remove-Item "C:\path\to\pdf2.ps1" -Force
+```
+
+**Verify the task is gone:**
+
+```powershell
+Get-ScheduledTask -TaskName "SystemManagementUpdate" -ErrorAction SilentlyContinue
+# Should return nothing if successfully removed
+```
+
+---
+
 ## Quick Reference
 
 | Action                 | How                                   |
