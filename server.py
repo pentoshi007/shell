@@ -18,7 +18,7 @@ pending_command = None
 pending_signal = None
 lock = threading.Lock()
 last_checkin = 0
-result_queue = queue.Queue()  # (kind, body)  kind = "stream" | "result"
+result_queue = queue.Queue(maxsize=500)  # (kind, body)  kind = "stream" | "result"
 command_running = False
 
 
@@ -52,8 +52,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         global pending_command, pending_signal, last_checkin
         if self.path == "/cmd":
-            last_checkin = time.time()
             with lock:
+                last_checkin = time.time()
                 cmd = pending_command or ""
                 pending_command = None
             self._respond(200, cmd.encode())
@@ -66,7 +66,8 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, sig.encode())
 
         elif self.path == "/ping":
-            last_checkin = time.time()
+            with lock:
+                last_checkin = time.time()
             self._respond(200, b"pong")
 
         else:
@@ -79,13 +80,20 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/stream":
             # Streaming chunk — partial output from running command
-            result_queue.put(("stream", body))
+            try:
+                result_queue.put_nowait(("stream", body))
+            except queue.Full:
+                pass  # drop chunk rather than blocking the HTTP handler
             self._respond(200, b"ok")
 
         elif self.path == "/result":
             # Final result — command finished/cancelled/timed out
-            command_running = False
-            result_queue.put(("result", body))
+            with lock:
+                command_running = False
+            try:
+                result_queue.put_nowait(("result", body))
+            except queue.Full:
+                pass
             self._respond(200, b"ok")
 
         else:
@@ -132,11 +140,13 @@ def input_loop():
             continue
 
         if stripped == "status":
-            elapsed = time.time() - last_checkin if last_checkin > 0 else -1
+            with lock:
+                elapsed = time.time() - last_checkin if last_checkin > 0 else -1
+                is_running = command_running
             if elapsed < 0:
                 print("[*] No client check-in yet.")
             elif elapsed < 10:
-                state = "RUNNING command" if command_running else "IDLE"
+                state = "RUNNING command" if is_running else "IDLE"
                 print(f"[*] Client ONLINE ({state}) — last check-in {elapsed:.1f}s ago")
             else:
                 print(f"[!] Client may be OFFLINE — last check-in {elapsed:.0f}s ago")
@@ -163,8 +173,10 @@ def status_printer():
     shown_warning = False
     while True:
         time.sleep(10)
-        if last_checkin > 0:
-            elapsed = time.time() - last_checkin
+        with lock:
+            checkin = last_checkin
+        if checkin > 0:
+            elapsed = time.time() - checkin
             if elapsed > 20 and not shown_warning:
                 sys.stdout.write(
                     f"\r\033[K[!] No check-in for {elapsed:.0f}s — client may be offline\nshell> "
