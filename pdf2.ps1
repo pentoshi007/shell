@@ -246,10 +246,6 @@ function Invoke-InteractiveCommand {
     $proc.StartInfo = $psi
 
     $streamQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-    $outHandler = [System.Diagnostics.DataReceivedEventHandler]{
-        param($sender, $e)
-        if ($e.Data -ne $null) { $streamQueue.Enqueue($e.Data + "`n") }
-    }
 
     try {
         if (-not $proc.Start()) {
@@ -261,8 +257,12 @@ function Invoke-InteractiveCommand {
         return
     }
 
-    $proc.add_OutputDataReceived($outHandler)
-    $proc.add_ErrorDataReceived($outHandler)
+    $outEvent = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $streamQueue -Action {
+        if ($EventArgs.Data -ne $null) { $Event.MessageData.Enqueue($EventArgs.Data + "`n") }
+    }
+    $errEvent = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $streamQueue -Action {
+        if ($EventArgs.Data -ne $null) { $Event.MessageData.Enqueue($EventArgs.Data + "`n") }
+    }
     $proc.BeginOutputReadLine()
     $proc.BeginErrorReadLine()
 
@@ -333,6 +333,10 @@ function Invoke-InteractiveCommand {
 
     try { $proc.CancelOutputRead() } catch {}
     try { $proc.CancelErrorRead() } catch {}
+    try { Unregister-Event -SourceIdentifier $outEvent.Name -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-Event -SourceIdentifier $errEvent.Name -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job -Id $outEvent.Id -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job -Id $errEvent.Id -Force -ErrorAction SilentlyContinue } catch {}
     try { $proc.StandardInput.Close() } catch {}
     try { $proc.Dispose() } catch {}
 }

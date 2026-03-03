@@ -123,6 +123,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with lock:
                 client = get_or_create_client(client_id)
+                client["last_checkin"] = time.time()
                 sig = client["pending_signal"] or ""
                 client["pending_signal"] = None
             self._respond(200, sig.encode())
@@ -133,6 +134,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with lock:
                 client = get_or_create_client(client_id)
+                client["last_checkin"] = time.time()
                 lines = client["pending_stdin"]
                 data = "\n".join(lines) if lines else ""
                 client["pending_stdin"] = []
@@ -157,6 +159,10 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode(errors="replace")
 
         if path == "/stream":
+            if client_id:
+                with lock:
+                    client = get_or_create_client(client_id)
+                    client["last_checkin"] = time.time()
             try:
                 result_queue.put_nowait((client_id, "stream", body))
             except queue.Full:
@@ -167,6 +173,7 @@ class Handler(BaseHTTPRequestHandler):
             if client_id:
                 with lock:
                     client = get_or_create_client(client_id)
+                    client["last_checkin"] = time.time()
                     client["command_running"] = False
                     client["pending_stdin"] = []
             # Use blocking put with timeout for /result — must not be silently dropped
