@@ -70,7 +70,25 @@ function Write-Log {
 # --- HTTP setup ---
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 4
 [System.Net.ServicePointManager]::Expect100Continue = $false
-try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13 } catch {
+    try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+}
+# Bypass SSL cert validation — SYSTEM account lacks Cloudflare root CAs in its cert store
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; }
+}
+"@
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = [TrustAllCertsPolicy]::new()
+} catch {
+    # Fallback for newer .NET: use callback
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+}
 
 # --- HTTP helpers ---
 function Send-Http {
