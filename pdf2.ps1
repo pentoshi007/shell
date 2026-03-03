@@ -216,6 +216,22 @@ function Invoke-CommandStreaming {
     }
     # --- end notimeout ---
 
+    # --- INTERACTIVE COMMAND BLOCKLIST (removable) ---
+    # These commands wait for stdin and will hang the client indefinitely.
+    # Commands WITH arguments (e.g. 'cmd /c dir', 'python script.py') are allowed.
+    $interactiveBlocklist = @('cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe',
+                              'python', 'python3', 'python.exe', 'node', 'node.exe',
+                              'nslookup', 'ftp', 'telnet', 'wsl', 'bash',
+                              'diskpart', 'debug', 'edit', 'edlin')
+    $firstToken = ($Command.Trim() -split '\s+', 2)[0].ToLower()
+    $hasArgs = ($Command.Trim() -split '\s+').Count -gt 1
+    if ($interactiveBlocklist -contains $firstToken -and -not $hasArgs) {
+        Send-Result-To-Server -Body "[!] Blocked: '$firstToken' is interactive and would hang the client.`nUse with arguments instead (e.g. 'cmd /c dir', 'python script.py').`n"
+        Write-Log "Blocked interactive command: $Command" "WARN"
+        return
+    }
+    # --- end interactive blocklist ---
+
     # 1) Send header — read cwd from persistent runspace (reflects cd changes)
     $timeoutLabel = if ($noTimeout) { "no-timeout" } else { "${Timeout}s" }
     $runspace = Get-PersistentRunspace
