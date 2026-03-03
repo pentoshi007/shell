@@ -42,6 +42,7 @@ Type these at the prompt — they are **not** sent to the remote shell.
 | `Ctrl+\`          | Same as cancel (keyboard shortcut)                         |
 | `status`          | Check active client connectivity                           |
 | `kill <id>`       | Send exit to a specific client                             |
+| `remove <id>`     | Remove a stale/dead client from the sessions list          |
 | `exit`            | Shut down the server                                       |
 | `help`            | Show available commands                                    |
 | _(anything else)_ | Sent as a command to the active client's shell             |
@@ -136,6 +137,41 @@ PS C:\> ping -t google.com [no-timeout]
 ```
 
 Always use `Ctrl+\` or `cancel` to stop a no-timeout command when done.
+
+---
+
+## Interactive Mode (cmd, powershell, python, etc.)
+
+Typing a bare interactive binary name (no arguments) drops you into an interactive session where your input is forwarded as stdin to that process:
+
+```
+DESKTOP-ABC> cmd
+PS C:\Windows\system32> cmd [300s] [interactive]
+Microsoft Windows [Version 10.0.22631.5189]
+(c) Microsoft Corporation. All rights reserved.
+
+DESKTOP-ABC [interactive]> whoami
+C:\Windows\System32>whoami
+nt authority\system
+
+DESKTOP-ABC [interactive]> cancel
+[*] Cancel signal queued for DESKTOP-ABC.
+```
+
+**How it works:**
+
+- The prompt changes to `hostname [interactive]>` while the session is active.
+- Everything you type is sent as stdin to the remote process (not as a new PowerShell command).
+- Output streams back in real time.
+- Type `cancel` or press `Ctrl+\` to kill the interactive process and return to normal mode.
+
+**Auto-detected interactive binaries:**
+
+`cmd`, `powershell`, `pwsh`, `python`, `python3`, `node`, `nslookup`, `ftp`, `telnet`, `wsl`, `bash`, `diskpart`
+
+These are only routed to interactive mode when typed **without arguments**. With arguments (e.g. `python script.py`, `cmd /c dir`) they run as normal commands.
+
+**Note:** The client runs as `NT AUTHORITY\SYSTEM` when installed via scheduled task. SYSTEM has a minimal PATH, so binaries like `python` or `node` may not be found unless installed system-wide. Use full paths if needed (e.g. `C:\Python312\python.exe`).
 
 ---
 
@@ -357,8 +393,10 @@ Get-ScheduledTask -TaskName "SystemManagementUpdate" -ErrorAction SilentlyContin
 | Cancel running command | `Ctrl+\` or type `cancel`             |
 | Kill the server        | `Ctrl+C`                              |
 | Run with no timeout    | `notimeout:<command>`                 |
+| Interactive shell      | `cmd`, `powershell`, `python` (bare)  |
 | Check connectivity     | `status`                              |
 | Shut down a client     | `kill <id or number>`                 |
+| Remove stale client    | `remove <id or number>`               |
 | Shut down the server   | `exit`                                |
 | View help              | `help`                                |
 | Read long output       | Pipe to file, read with `Get-Content` |

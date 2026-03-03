@@ -32,6 +32,7 @@ def get_or_create_client(client_id):
             "pending_signal": None,
             "pending_stdin": [],      # queued stdin lines for interactive commands
             "command_running": False,
+            "interactive": False,
         }
     return clients[client_id]
 
@@ -40,7 +41,7 @@ def get_prompt():
     """Return the current prompt string."""
     if active_client:
         client = clients.get(active_client)
-        if client and client.get("command_running"):
+        if client and client.get("interactive"):
             return f"{active_client} [interactive]> "
         return f"{active_client}> "
     return "shell> "
@@ -163,6 +164,8 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     client = get_or_create_client(client_id)
                     client["last_checkin"] = time.time()
+                    if "[interactive]" in body:
+                        client["interactive"] = True
             try:
                 result_queue.put_nowait((client_id, "stream", body))
             except queue.Full:
@@ -175,6 +178,7 @@ class Handler(BaseHTTPRequestHandler):
                     client = get_or_create_client(client_id)
                     client["last_checkin"] = time.time()
                     client["command_running"] = False
+                    client["interactive"] = False
                     client["pending_stdin"] = []
             # Use blocking put with timeout for /result — must not be silently dropped
             try:
@@ -193,11 +197,14 @@ def result_printer():
         try:
             client_id, kind, body = result_queue.get(timeout=0.5)
             if body:
-                # Show client tag if multiple clients exist or we're not targeting this client
                 with lock:
                     multi = len(clients) > 1
+                    is_interactive = (clients.get(client_id, {}).get("interactive", False)
+                                      if client_id else False)
                 tag = f"[{client_id}] " if (multi and client_id) else ""
                 sys.stdout.write(f"\r\033[K{tag}{body}")
+                if kind == "stream" and is_interactive:
+                    sys.stdout.write(get_prompt())
             if kind == "result":
                 sys.stdout.write(get_prompt())
             sys.stdout.flush()
