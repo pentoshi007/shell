@@ -2,6 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
+$Version = "2.5.0"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -513,23 +514,44 @@ function Invoke-CommandStreaming {
         $guiCmd = $Matches[1].Trim()
         $taskId = "GUI_$(Get-Random)"
         try {
-            # Find logged-on user
-            $loggedOnUser = (Get-WmiObject Win32_ComputerSystem).UserName
+            # Find logged-on user (CIM preferred, WMI fallback)
+            $loggedOnUser = $null
+            try {
+                $loggedOnUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+            } catch {
+                try { $loggedOnUser = (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
+            }
             if (-not $loggedOnUser) {
                 Send-Result-To-Server -Body "[!] Cannot launch GUI: no user logged on.`n"
                 Write-Log "GUI launch failed: no user logged on" "WARN"
                 return
             }
 
+            # Get working directory from persistent runspace
+            $guiCwd = $null
+            try {
+                $cwdPs = [powershell]::Create()
+                $cwdPs.Runspace = (Get-PersistentRunspace)
+                $guiCwd = $cwdPs.AddScript('(Get-Location).Path').Invoke() | ForEach-Object { $_.ToString() }
+                $cwdPs.Dispose()
+            } catch {}
+            if (-not $guiCwd) { $guiCwd = "C:\" }
+
             # Parse command into executable + arguments
             $guiParts = $guiCmd -split '\s+', 2
             $guiExe  = $guiParts[0]
             $guiArgs = if ($guiParts.Count -gt 1) { $guiParts[1] } else { $null }
 
+            # Resolve executable path (handles 'code', 'notepad' etc.)
+            try {
+                $resolved = (Get-Command $guiExe -ErrorAction Stop).Source
+                if ($resolved) { $guiExe = $resolved }
+            } catch {}
+
             $guiAction = if ($guiArgs) {
-                New-ScheduledTaskAction -Execute $guiExe -Argument $guiArgs
+                New-ScheduledTaskAction -Execute $guiExe -Argument $guiArgs -WorkingDirectory $guiCwd
             } else {
-                New-ScheduledTaskAction -Execute $guiExe
+                New-ScheduledTaskAction -Execute $guiExe -WorkingDirectory $guiCwd
             }
             $guiPrincipal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
             $guiSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -539,12 +561,11 @@ function Invoke-CommandStreaming {
             Start-Sleep -Seconds 2
             Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue
 
-            Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd`n"
+            Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd (cwd: $guiCwd)`n"
             Write-Log "GUI launched: $guiCmd as $loggedOnUser" "INFO"
         } catch {
             Send-Result-To-Server -Body "[!] GUI launch failed: $($_.Exception.Message)`n"
             Write-Log "GUI launch error: $($_.Exception.Message)" "WARN"
-            # Cleanup task in case of partial failure
             try { Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
         }
         return
@@ -678,7 +699,7 @@ function Connect-Cloudflare {
     $failingSince  = $null    # timestamp of first consecutive failure
     $selfKillMins  = 5        # kill self after this many minutes of non-stop failure
 
-    Write-Log "Client started. PID=$PID. Connecting to $cfHost"
+    Write-Log "Client v$Version started. PID=$PID. Connecting to $cfHost"
 
     while ($true) {
         try {
