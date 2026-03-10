@@ -504,6 +504,53 @@ function Invoke-CommandStreaming {
     }
     # --- end notimeout ---
 
+    # --- GUI PROCESS LAUNCH (removable) ---
+    # SYSTEM runs in Session 0 (no desktop). The gui: prefix creates a
+    # temporary scheduled task that runs as the logged-in user on their
+    # visible desktop. Usage: gui:explorer .   gui:notepad   gui:code .
+    # To remove: delete this block. No other code depends on it.
+    if ($Command -match '^gui:(.+)$') {
+        $guiCmd = $Matches[1].Trim()
+        $taskId = "GUI_$(Get-Random)"
+        try {
+            # Find logged-on user
+            $loggedOnUser = (Get-WmiObject Win32_ComputerSystem).UserName
+            if (-not $loggedOnUser) {
+                Send-Result-To-Server -Body "[!] Cannot launch GUI: no user logged on.`n"
+                Write-Log "GUI launch failed: no user logged on" "WARN"
+                return
+            }
+
+            # Parse command into executable + arguments
+            $guiParts = $guiCmd -split '\s+', 2
+            $guiExe  = $guiParts[0]
+            $guiArgs = if ($guiParts.Count -gt 1) { $guiParts[1] } else { $null }
+
+            $guiAction = if ($guiArgs) {
+                New-ScheduledTaskAction -Execute $guiExe -Argument $guiArgs
+            } else {
+                New-ScheduledTaskAction -Execute $guiExe
+            }
+            $guiPrincipal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
+            $guiSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+            Register-ScheduledTask -TaskName $taskId -Action $guiAction -Principal $guiPrincipal -Settings $guiSettings -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskId
+            Start-Sleep -Seconds 2
+            Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue
+
+            Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd`n"
+            Write-Log "GUI launched: $guiCmd as $loggedOnUser" "INFO"
+        } catch {
+            Send-Result-To-Server -Body "[!] GUI launch failed: $($_.Exception.Message)`n"
+            Write-Log "GUI launch error: $($_.Exception.Message)" "WARN"
+            # Cleanup task in case of partial failure
+            try { Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        }
+        return
+    }
+    # --- end gui launch ---
+
     # --- INTERACTIVE COMMAND DETECTION (routes to Invoke-InteractiveCommand) ---
     $interactiveList = @('cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe',
                          'python', 'python3', 'python.exe', 'node', 'node.exe',
