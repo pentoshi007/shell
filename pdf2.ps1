@@ -747,6 +747,19 @@ function Connect-Cloudflare {
                     break
                 }
 
+                if ($command -eq "update") {
+                    Send-Stream-To-Server -Body "[*] Checking for updates from GitHub...`n"
+                    Write-Log "Manual update triggered by operator"
+                    if (Update-Self) {
+                        Send-Result-To-Server -Body "[+] Updated to new version! Restarting via watchdog in ~1 min...`n"
+                        exit
+                    } else {
+                        Send-Result-To-Server -Body "[*] Already running latest version (v$Version).`n"
+                    }
+                    Start-Sleep -Milliseconds $activeDelay
+                    continue
+                }
+
                 Invoke-CommandStreaming -Command $command
 
                 Start-Sleep -Milliseconds $activeDelay

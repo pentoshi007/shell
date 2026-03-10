@@ -387,9 +387,10 @@ def input_loop():
             print("      remove   — remove a stale/dead client from sessions")
             print("      exit     — shut down the server")
             print("      help     — show this message")
-            print("    Prefixes:")
-            print("      gui:<cmd>       — launch GUI app on user's desktop (e.g. gui:explorer .)")
-            print("      notimeout:<cmd> — run with no timeout")
+            print("    Client commands:")
+            print("      update           — force immediate self-update from GitHub")
+            print("      gui:<cmd>        — launch GUI app on user's desktop (e.g. gui:explorer .)")
+            print("      notimeout:<cmd>  — run with no timeout")
             print("    Anything else is sent to the active client's shell.")
             continue
 
