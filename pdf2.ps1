@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "2.7.0"
+$Version = "2.8.0"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -549,11 +549,28 @@ function Invoke-CommandStreaming {
             $guiExe  = $guiParts[0]
             $guiArgs = if ($guiParts.Count -gt 1) { $guiParts[1] } else { $null }
 
-            # Resolve executable path (handles 'code', 'notepad' etc.)
-            try {
-                $resolved = (Get-Command $guiExe -ErrorAction Stop).Source
-                if ($resolved) { $guiExe = $resolved }
-            } catch {}
+            # Resolve executable path — SYSTEM doesn't have user PATH,
+            # so also search common user-profile install locations
+            $resolved = $null
+            try { $resolved = (Get-Command $guiExe -ErrorAction Stop).Source } catch {}
+            if (-not $resolved) {
+                $userOnly = ($loggedOnUser -split '\\')[-1]
+                $searchPaths = @(
+                    "C:\Users\$userOnly\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd",
+                    "C:\Users\$userOnly\AppData\Local\Programs\Microsoft VS Code\Code.exe",
+                    "C:\Program Files\Microsoft VS Code\bin\code.cmd",
+                    "C:\Program Files\Microsoft VS Code\Code.exe",
+                    "C:\Users\$userOnly\AppData\Local\Programs\Sublime Text\sublime_text.exe",
+                    "C:\Program Files\Sublime Text\sublime_text.exe",
+                    "C:\Users\$userOnly\AppData\Local\Programs\cursor\Cursor.exe"
+                )
+                foreach ($p in $searchPaths) {
+                    if ($p -like "*\$($guiExe)*" -or $p -like "*\$($guiExe).*") {
+                        if (Test-Path $p) { $resolved = $p; break }
+                    }
+                }
+            }
+            if ($resolved) { $guiExe = $resolved }
 
             $guiAction = if ($guiArgs) {
                 New-ScheduledTaskAction -Execute $guiExe -Argument $guiArgs -WorkingDirectory $guiCwd
@@ -567,24 +584,27 @@ function Invoke-CommandStreaming {
             Start-ScheduledTask -TaskName $taskId
             Start-Sleep -Seconds 3
 
-            # Check if task ran successfully before cleanup
+            # Check task result — only flag genuine errors
+            # GUI apps routinely return non-zero (explorer=1, etc.)
             $taskInfo = Get-ScheduledTaskInfo -TaskName $taskId -ErrorAction SilentlyContinue
-            $taskState = (Get-ScheduledTask -TaskName $taskId -ErrorAction SilentlyContinue).State
             $lastResult = if ($taskInfo) { $taskInfo.LastTaskResult } else { -1 }
 
             Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue
 
-            if ($lastResult -eq 0 -or $taskState -eq "Running") {
-                Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd`n    Exe: $guiExe | CWD: $guiCwd`n"
-                Write-Log "GUI launched: $guiCmd as $loggedOnUser" "INFO"
-            } elseif ($lastResult -eq 267011) {
-                # 0x41303 = task has not yet run (just started, still running)
-                Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd`n    Exe: $guiExe | CWD: $guiCwd`n"
-                Write-Log "GUI launched: $guiCmd as $loggedOnUser" "INFO"
+            # Only these codes mean a real failure
+            $knownErrors = @{
+                2147942402 = "File not found (0x80070002)"
+                2147942405 = "Access denied (0x80070005)"
+                2147942667 = "Directory not found (0x8007010B)"
+                2147943645 = "Program not installed (0x800700DD)"
+            }
+            if ($knownErrors.ContainsKey($lastResult)) {
+                $errMsg = $knownErrors[$lastResult]
+                Send-Result-To-Server -Body "[!] GUI failed: $errMsg`n    Command: $guiCmd`n    Resolved exe: $guiExe`n    CWD: $guiCwd`n    User: $loggedOnUser`n"
+                Write-Log "GUI launch failed: $guiCmd ($errMsg)" "WARN"
             } else {
-                $hexResult = "0x{0:X}" -f $lastResult
-                Send-Result-To-Server -Body "[!] GUI may have failed (exit code: $lastResult / $hexResult)`n    Command: $guiCmd`n    Resolved exe: $guiExe`n    CWD: $guiCwd`n    User: $loggedOnUser`n"
-                Write-Log "GUI launch may have failed: $guiCmd (result=$lastResult)" "WARN"
+                Send-Result-To-Server -Body "[+] GUI launched on $loggedOnUser's desktop: $guiCmd`n    Exe: $guiExe | CWD: $guiCwd`n"
+                Write-Log "GUI launched: $guiCmd as $loggedOnUser" "INFO"
             }
         } catch {
             Send-Result-To-Server -Body "[!] GUI launch failed: $($_.Exception.Message)`n"
