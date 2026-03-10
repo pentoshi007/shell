@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -409,6 +409,12 @@ def input_loop():
             print("    gui:notepad          Open Notepad visibly")
             print("    gui:code .           Open VS Code in current dir")
             print("    notimeout:ping -t 8.8.8.8   Run forever until cancel")
+            print()
+            print("  SHORTCUTS (auto-routes to gui):")
+            print("    camera               Open Camera app")
+            print("    recorder             Open Sound Recorder")
+            print("    settings             Open Windows Settings")
+            print("    calc                 Open Calculator")
             print()
             print("  SERVER:")
             print("    exit               Shut down THIS server (not client)")

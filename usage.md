@@ -114,6 +114,17 @@ nt authority\system
 | `gui:<cmd>` | Launch GUI app on user's desktop | `gui:explorer .` |
 | `notimeout:<cmd>` | Run without 300s timeout | `notimeout:ping -t 8.8.8.8` |
 
+### Shortcuts (auto-route to GUI)
+
+Just type the name — no `gui:` prefix needed:
+
+| Command | Opens |
+|---|---|
+| `camera` | Windows Camera app |
+| `recorder` | Sound Recorder |
+| `settings` | Windows Settings |
+| `calc` | Calculator |
+
 ### Server Commands
 
 | Command | Description |

