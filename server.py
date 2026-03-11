@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.1.1"
+VERSION = "3.1.2"
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 # Set TOKEN to any hard-to-guess string (e.g. a random UUID).
@@ -170,11 +170,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if not self._check_token():
-            self._respond(403, b"forbidden")
-            return
         parsed = urlparse(self.path)
-        path = parsed.path
+        path   = parsed.path
+        # Browser-facing viewer pages cannot send custom headers — exempt them.
+        if path not in ("/camera_view", "/camera_snapshot"):
+            if not self._check_token():
+                self._respond(403, b"forbidden")
+                return
         client_id = self._parse_client_id()
 
         if path == "/cmd":

