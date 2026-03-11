@@ -109,6 +109,7 @@ nt authority\system
 
 | Command | Description | Example |
 |---|---|---|
+| `get <filepath>` | Copy file from Windows VM to ~/Desktop on Mac | `get C:\Users\user\file.txt` |
 | `version` | Show client version, host, PID | `version` |
 | `update` | Force immediate self-update from GitHub | `update` |
 | `gui:<cmd>` | Launch GUI app on user's desktop | `gui:explorer .` |
@@ -329,6 +330,7 @@ pkill cloudflared
 
 | Action | Command |
 |---|---|
+| Copy file from VM | `get C:\path\to\file.txt` |
 | List clients | `sessions` |
 | Select target | `use <id>` or `use <name>` |
 | Check version | `version` |

