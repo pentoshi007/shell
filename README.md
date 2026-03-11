@@ -1,4 +1,4 @@
-# Shell C2 — v2.5.0
+# Shell C2 — v3.1.1
 
 A resilient, persistent remote command & control shell. Operator server runs on Mac/Linux, client runs on Windows as SYSTEM. Connected securely via Cloudflare Tunnel.
 
@@ -113,6 +113,6 @@ Remove-Item C:\pdf2.ps1, C:\shell.txt -Force -ErrorAction SilentlyContinue
 
 | Version | Changes |
 |---|---|
-| **2.5.0** | GUI launch (`gui:` prefix), auto-update from GitHub, anti-sleep, interactive sessions, chunked output, version tracking |
+| **3.1.1** | Pull-based camera streaming, dedicated camera stop signaling, stale-frame detection, and long-poll reliability fixes |
 | **2.0.0** | Streaming execution, persistence, SSL bypass, watchdog, cancel support |
 | **1.0.0** | Basic polling, single client, no persistence |

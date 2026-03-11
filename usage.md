@@ -1,4 +1,4 @@
-# Shell C2 — Usage Guide (v2.8.0)
+# Shell C2 — Usage Guide (v3.1.1)
 
 ## Architecture
 
@@ -197,7 +197,7 @@ DESKTOP-ABC> gui:calc              → Opens Calculator
 
 ```
 DESKTOP-ABC> version
-[*] Client Version: v2.8.0
+[*] Client Version: v3.1.1
     Host: DESKTOP-ABC
     User: SYSTEM
     PID: 4312
@@ -287,7 +287,7 @@ Located at `C:\shell.txt` (same dir as script). Auto-rotates at 5 MB.
 
 | Entry | Meaning |
 |---|---|
-| `Client v2.8.0 started. PID=...` | Client launched |
+| `Client v3.1.1 started. PID=...` | Client launched |
 | `CMD: <command>` | Command received |
 | `Connection error #N` | Cloudflare tunnel issue — auto retries |
 | `Update found! Hash xxx.. -> yyy..` | Auto-update applying |
