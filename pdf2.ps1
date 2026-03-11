@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.4"
+$Version = "3.1.5"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -862,6 +862,19 @@ function Invoke-CommandStreaming {
         return
     }
     # --- end interactive detection ---
+
+    # --- SESSION-0 GUI BLOCKER (removable) ---
+    # SYSTEM runs in Session 0 (no desktop). Cmdlets that open GUI windows will
+    # block indefinitely until the 300s timeout fires. Detect and reject them.
+    $guiBlockList = @('out-gridview', 'show-command', 'show-controlpanelitem')
+    $cmdLower = $Command.ToLower()
+    foreach ($blocked in $guiBlockList) {
+        if ($cmdLower -match "\b$([regex]::Escape($blocked))\b") {
+            Send-Result-To-Server -Body "[!] '$blocked' opens a GUI window and cannot run in Session 0 (SYSTEM has no desktop).`n    Use 'gui:' prefix to run commands on the logged-in user's desktop instead.`n"
+            return
+        }
+    }
+    # --- end session-0 gui blocker ---
 
     # 1) Send header — read cwd from persistent runspace (reflects cd changes)
     $timeoutLabel = if ($noTimeout) { "no-timeout" } else { "${Timeout}s" }
