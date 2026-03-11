@@ -34,7 +34,7 @@ Endpoints NOT included (new server.py only):
 """
 
 VERSION = "compat-old-client"
-TOKEN = "CHANGE_ME_TO_A_SECRET"  # must match server.py
+TOKEN = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py
 ENFORCE_TOKEN = False           # old clients don't send token — let them through
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -435,7 +435,7 @@ def input_loop():
                         )
                         if elapsed < 0:
                             status = "NEVER SEEN"
-                        elif elapsed < 10:
+                        elif elapsed < 45:
                             mode = "RUNNING" if state["command_running"] else "IDLE"
                             status = f"ONLINE ({mode}) — {elapsed:.1f}s ago"
                         else:
@@ -477,7 +477,7 @@ def input_loop():
                 is_running = client["command_running"]
             if elapsed < 0:
                 print(f"[*] {active_client}: No check-in yet.")
-            elif elapsed < 10:
+            elif elapsed < 45:
                 state = "RUNNING command" if is_running else "IDLE"
                 print(
                     f"[*] {active_client}: ONLINE ({state}) — last check-in {elapsed:.1f}s ago"

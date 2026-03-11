@@ -11,7 +11,7 @@ VERSION = "3.1.1"
 # Set TOKEN to any hard-to-guess string (e.g. a random UUID).
 # Clients must send it as the X-Token header on every request.
 # ENFORCE_TOKEN = True → unknown callers get 403 (production mode).
-TOKEN = "CHANGE_ME_TO_A_SECRET"
+TOKEN = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"
 ENFORCE_TOKEN = True
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -546,7 +546,7 @@ def input_loop():
                         )
                         if elapsed < 0:
                             status = "NEVER SEEN"
-                        elif elapsed < 10:
+                        elif elapsed < 45:
                             mode = "RUNNING" if state["command_running"] else "IDLE"
                             status = f"ONLINE ({mode}) — {elapsed:.1f}s ago"
                         else:
@@ -588,7 +588,7 @@ def input_loop():
                 is_running = client["command_running"]
             if elapsed < 0:
                 print(f"[*] {active_client}: No check-in yet.")
-            elif elapsed < 10:
+            elif elapsed < 45:
                 state = "RUNNING command" if is_running else "IDLE"
                 print(
                     f"[*] {active_client}: ONLINE ({state}) — last check-in {elapsed:.1f}s ago"

