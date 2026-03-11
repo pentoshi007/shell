@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.2"
+$Version = "3.1.3"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
