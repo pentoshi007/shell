@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.0.0"
+$Version = "3.0.1"
 $cfHost = "https://connect.aniketpandey.website"
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
@@ -130,11 +130,6 @@ $script:lastUpdateCheck = Get-Date
 
 function Update-Self {
     <# Returns $true if script was updated and a restart is needed. #>
-    # EXE deployments: don't overwrite the .exe with .ps1 content
-    if ($selfPath -match '\.exe$') {
-        Write-Log "Skipping update: running from EXE ($selfPath)" "INFO"
-        return $false
-    }
     try {
         $script:lastUpdateCheck = Get-Date
 
