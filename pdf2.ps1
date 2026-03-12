@@ -1298,6 +1298,19 @@ function Connect-Cloudflare {
 
                         if ($isSystem -and $loggedOnUser) {
                             # --- SYSTEM path: one-shot scheduled task runs as logged-on user ---
+                            # Pre-clean stale residue from interrupted older captures
+                            try {
+                                Get-ScheduledTask -TaskName "Capture_*" -ErrorAction SilentlyContinue | ForEach-Object {
+                                    try { Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+                                    try { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                                }
+                            } catch {}
+                            try {
+                                Get-ChildItem $env:TEMP -Filter 'cap_*.ps1' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                                Get-ChildItem $env:TEMP -Filter 'cap_out_*.jpg' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                                Get-ChildItem $env:TEMP -Filter 'cap_err_*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                            } catch {}
+
                             $capTaskId  = "Capture_$(Get-Random)"
                             $capScript  = Join-Path $env:TEMP "cap_$capTaskId.ps1"
                             $capOut     = Join-Path $env:TEMP "cap_out_$capTaskId.jpg"
@@ -1328,11 +1341,23 @@ try {
                             $capSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
                             Register-ScheduledTask -TaskName $capTaskId -Action $capAction -Principal $capPrincipal -Settings $capSettings -Force | Out-Null
                             Start-ScheduledTask -TaskName $capTaskId
-                            # Wait up to 12s for the output file
-                            $deadline = (Get-Date).AddSeconds(12)
+                            # Wait up to 25s for slower VMs / delayed interactive desktop attach
+                            $deadline = (Get-Date).AddSeconds(25)
                             while ((Get-Date) -lt $deadline -and -not (Test-Path $capOut) -and -not (Test-Path $capErr)) {
                                 Start-Sleep -Milliseconds 300
                             }
+                            $taskInfo = $null
+                            $taskState = 'Unknown'
+                            $lastResult = -1
+                            try {
+                                $taskInfo = Get-ScheduledTaskInfo -TaskName $capTaskId -ErrorAction SilentlyContinue
+                                if ($taskInfo) {
+                                    $lastResult = $taskInfo.LastTaskResult
+                                    try {
+                                        $taskState = (Get-ScheduledTask -TaskName $capTaskId -ErrorAction SilentlyContinue).State.ToString()
+                                    } catch {}
+                                }
+                            } catch {}
                             # Cleanup task
                             try { Stop-ScheduledTask      -TaskName $capTaskId -ErrorAction SilentlyContinue } catch {}
                             try { Unregister-ScheduledTask -TaskName $capTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
@@ -1342,7 +1367,11 @@ try {
                                 try { Remove-Item $capErr -Force -ErrorAction SilentlyContinue } catch {}
                                 throw $errTxt
                             }
-                            if (-not (Test-Path $capOut)) { throw 'Screenshot task timed out — no output produced' }
+                            if (-not (Test-Path $capOut)) {
+                                try { Remove-Item $capOut -Force -ErrorAction SilentlyContinue } catch {}
+                                try { Remove-Item $capErr -Force -ErrorAction SilentlyContinue } catch {}
+                                throw "Screenshot task timed out - no output produced (taskState=$taskState, lastTaskResult=$lastResult, user=$loggedOnUser)"
+                            }
                             $jpegBytes = [System.IO.File]::ReadAllBytes($capOut)
                             try { Remove-Item $capOut -Force -ErrorAction SilentlyContinue } catch {}
                         } else {
