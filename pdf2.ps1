@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.2.1"
+$Version = "3.2.2"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -113,11 +113,21 @@ try {
     powercfg /setactive SCHEME_CURRENT 2>$null
 } catch {}
 
-# --- CLEANUP ORPHANED GUI TASKS (from previous crashes) ---
+# --- CLEANUP ORPHANED TASKS AND TEMP FILES (from previous crashes) ---
 try {
     Get-ScheduledTask -TaskName "GUI_*" -ErrorAction SilentlyContinue | ForEach-Object {
         Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
     }
+} catch {}
+try {
+    Get-ScheduledTask -TaskName "CameraCapture_*" -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+        Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+} catch {}
+try {
+    Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 } catch {}
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -1125,11 +1135,22 @@ function Connect-Cloudflare {
                         powercfg /change standby-timeout-ac 30 2>$null
                         powercfg /setactive SCHEME_CURRENT 2>$null
                     } catch {}
-                    # Cleanup any leftover GUI tasks
+                    # Cleanup any leftover tasks and temp files
+                    try { Stop-CameraStream } catch {}
                     try {
                         Get-ScheduledTask -TaskName "GUI_*" -ErrorAction SilentlyContinue | ForEach-Object {
                             Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
                         }
+                    } catch {}
+                    try {
+                        Get-ScheduledTask -TaskName "CameraCapture_*" -ErrorAction SilentlyContinue | ForEach-Object {
+                            try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+                            Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        }
+                    } catch {}
+                    try {
+                        Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'     -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
                     } catch {}
                     # Release mutex and stop
                     try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
@@ -1146,11 +1167,22 @@ function Connect-Cloudflare {
                     # 1) Unregister persistence tasks
                     try { Unregister-ScheduledTask -TaskName $taskName          -Confirm:$false -ErrorAction SilentlyContinue } catch {}
                     try { Unregister-ScheduledTask -TaskName $watchdogTaskName  -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-                    # 2) Unregister any GUI_* tasks left behind
+                    # 2) Stop stream + unregister all spawned tasks + wipe temp files
+                    try { Stop-CameraStream } catch {}
                     try {
                         Get-ScheduledTask -TaskName "GUI_*" -ErrorAction SilentlyContinue | ForEach-Object {
                             Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
                         }
+                    } catch {}
+                    try {
+                        Get-ScheduledTask -TaskName "CameraCapture_*" -ErrorAction SilentlyContinue | ForEach-Object {
+                            try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+                            Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        }
+                    } catch {}
+                    try {
+                        Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'     -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
                     } catch {}
                     # 3) Restore power policy
                     try {
