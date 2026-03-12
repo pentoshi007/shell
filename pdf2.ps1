@@ -361,10 +361,14 @@ function Send-Interactive-Flag {
 # ║  Browser polls /camera_view page which auto-refreshes the snapshot.       ║
 # ║  Stop: operator sends 'stopstream' which sets pending_signal=stopstream.  ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$script:cameraTask     = $null
-$script:cameraRunspace = $null
-$script:cameraTaskId   = $null
+$script:cameraTask       = $null
+$script:cameraRunspace   = $null
+$script:cameraTaskId     = $null
 $script:cameraScriptPath = $null
+$script:captureTaskId    = $null   # in-flight one-shot capture task
+$script:captureScriptPath = $null  # corresponding temp .ps1
+$script:captureOutPath   = $null   # temp .jpg output
+$script:captureErrPath   = $null   # temp error log
 
 # Helper: synchronously await a WinRT IAsyncOperation
 function Invoke-WinRTAsync {
@@ -668,7 +672,7 @@ function Stop-CameraStream {
         try { $script:cameraRunspace.Dispose() } catch {}
         $script:cameraRunspace = $null
     }
-    # Cleanup SYSTEM scheduled task (it self-stops via /signal poll)
+    # Cleanup SYSTEM scheduled task (stream path)
     if ($script:cameraTaskId) {
         try { Stop-ScheduledTask -TaskName $script:cameraTaskId -ErrorAction SilentlyContinue } catch {}
         try { Unregister-ScheduledTask -TaskName $script:cameraTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
@@ -682,7 +686,36 @@ function Stop-CameraStream {
         try { Remove-Item $script:cameraErrLog -Force -ErrorAction SilentlyContinue } catch {}
         $script:cameraErrLog = $null
     }
-    Write-Log 'Camera stopped' 'INFO'
+    # Cleanup any in-flight one-shot capture task and its temp files
+    if ($script:captureTaskId) {
+        try { Stop-ScheduledTask -TaskName $script:captureTaskId -ErrorAction SilentlyContinue } catch {}
+        try { Unregister-ScheduledTask -TaskName $script:captureTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        $script:captureTaskId = $null
+    }
+    if ($script:captureScriptPath) { try { Remove-Item $script:captureScriptPath -Force -ErrorAction SilentlyContinue } catch {}; $script:captureScriptPath = $null }
+    if ($script:captureOutPath)    { try { Remove-Item $script:captureOutPath    -Force -ErrorAction SilentlyContinue } catch {}; $script:captureOutPath    = $null }
+    if ($script:captureErrPath)    { try { Remove-Item $script:captureErrPath    -Force -ErrorAction SilentlyContinue } catch {}; $script:captureErrPath    = $null }
+    # Nuke any stray wildcard matches from previous crashes
+    try { Get-ScheduledTask -TaskName 'CameraCapture_*' -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+        try { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    } } catch {}
+    try { Get-ScheduledTask -TaskName 'Capture_*' -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+        try { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    } } catch {}
+    try { Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'     -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+    try { Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+    try { Get-ChildItem $env:TEMP -Filter 'cap_*.ps1'     -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+    try { Get-ChildItem $env:TEMP -Filter 'cap_out_*.jpg' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+    try { Get-ChildItem $env:TEMP -Filter 'cap_err_*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+    Write-Log 'Camera/Capture stopped and cleaned up' 'INFO'
+}
+
+# Crash/kill trap — runs when the script exits unexpectedly
+trap {
+    try { Stop-CameraStream } catch {}
+    break
 }
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -1372,6 +1405,11 @@ try {
                             $capSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
                             Register-ScheduledTask -TaskName $capTaskId -Action $capAction -Principal $capPrincipal -Settings $capSettings -Force | Out-Null
                             Start-ScheduledTask -TaskName $capTaskId
+                            # Track in script scope so Stop-CameraStream/trap can kill it if we crash mid-wait
+                            $script:captureTaskId     = $capTaskId
+                            $script:captureScriptPath = $capScript
+                            $script:captureOutPath    = $capOut
+                            $script:captureErrPath    = $capErr
                             Write-Log "Capture task started: $capTaskId as $loggedOnUser" "INFO"
                             # Wait up to 40s — VMs need extra time for interactive desktop binding
                             $deadline = (Get-Date).AddSeconds(40)
@@ -1380,10 +1418,12 @@ try {
                                 if (Test-Path $capErr) { break }
                                 Start-Sleep -Milliseconds 400
                             }
-                            # Cleanup task
+                            # Cleanup task and script-scope tracking
                             try { Stop-ScheduledTask      -TaskName $capTaskId -ErrorAction SilentlyContinue } catch {}
                             try { Unregister-ScheduledTask -TaskName $capTaskId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
                             try { Remove-Item $capScript -Force -ErrorAction SilentlyContinue } catch {}
+                            # Clear script-scope refs — task is done
+                            $script:captureTaskId = $null; $script:captureScriptPath = $null; $script:captureOutPath = $null; $script:captureErrPath = $null
                             if (Test-Path $capErr) {
                                 $errTxt = [System.IO.File]::ReadAllText($capErr).Trim()
                                 try { Remove-Item $capErr -Force -ErrorAction SilentlyContinue } catch {}
